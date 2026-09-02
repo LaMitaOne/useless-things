@@ -1,6 +1,8 @@
 # useless-things
 Some tries which didn't fully work out... maybe someone can use parts of it or... not... however :D    
-     
+    
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LaMitaOne/useless-things)    
+    
  **BGFX_Delphi**     
      
 Is a port of the FPC wrapper from https://github.com/Akira13641/PasBGFX. It compiles perfectly with zero compiler errors... but getting the actual C++ DLL built is a different story. I tried compiling the BGFX DLL myself, but after 6 hours of fighting the C++ build system, fixing missing files, and staring at endless syntax errors, I'm not even sure if it's officially possible anymore ^^.     
