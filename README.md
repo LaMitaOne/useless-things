@@ -10,5 +10,5 @@ Anyway, maybe someone out there can actually compile the DLL or find one somewhe
        
  **WebGPU4Delphi**          
       
-Is the start of a port of https://github.com/eliemichel/WebGPU-Cpp. The DLL loads, you get a surface, and yea... then loading something into it... BOOM! It explodes right into your face. Nah, seriously: It crashes constantly. I tried around a lot but couldn't get it running properly, so I let it be for now. But if someone wants to pick up the fight... this is a starting point.      
+Is the start of a port of https://github.com/eliemichel/WebGPU-Cpp. The DLL loads, you get a surface, and yea... then loading something into it... BOOM! It explodes right into your face. Nah, seriously: It crashes constantly. I tried around a lot but couldn't get it running properly, so I let it be for now. But if someone wants to pick up the fight... this is a starting point. Got a color painted now yipeee but a cube crash at shader or pipeline...but anyway a bit more now...     
       
