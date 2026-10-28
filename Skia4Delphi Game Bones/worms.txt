@@ -1,0 +1,483 @@
+{*******************************************************************************
+  SkiaWorms (Artillery & Destructible Terrain Prototype)
+********************************************************************************
+  A turn-based artillery prototype featuring destructible vector terrain, 
+  physics-based projectiles, and Z-depth collision.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaWorms;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 400;
+
+type
+  TWorm = class
+    Pos: TPointF;
+    IsPlayer: Boolean;
+    HP: Integer;
+    IsDead: Boolean;
+  end;
+
+  TProjectile = record
+    Pos: TPointF;
+    Vel: TPointF;
+    Active: Boolean;
+  end;
+
+  TSkiaWormsGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    
+    FWorms: TObjectList<TWorm>;
+    FCurrentWorm: Integer;
+    
+    FIsAiming: Boolean;
+    FAimStart: TPointF;
+    FAimCurrent: TPointF;
+    
+    FProj: TProjectile;
+    FExplosions: TList<TPointF>; // X,Y,Radius of active explosions
+    
+    FTerrainPath: ISkPath; // The destructible island
+    FTerrainHoles: TList<TPointF>; // Centers of blown out holes
+    
+    procedure InitGame;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure RebuildTerrain;
+    function IsPointInTerrain(P: TPointF): Boolean;
+    procedure Explode(Pos: TPointF; Radius: Single);
+    procedure NextTurn;
+    
+    procedure DrawTerrain(const ACanvas: ISkCanvas);
+    procedure DrawWorms(const ACanvas: ISkCanvas);
+    procedure DrawProjectile(const ACanvas: ISkCanvas);
+    procedure DrawAiming(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Single); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaWormsGame }
+
+constructor TSkiaWormsGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+
+  FActive := True;
+  FWorms := TObjectList<TWorm>.Create(True);
+  FExplosions := TList<TPointF>.Create;
+  FTerrainHoles := TList<TPointF>.Create;
+  
+  InitGame;
+  StartThread;
+end;
+
+destructor TSkiaWormsGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FWorms);
+  FreeAndNil(FExplosions);
+  FreeAndNil(FTerrainHoles);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaWormsGame.InitGame;
+var
+  W1, W2: TWorm;
+begin
+  FWorms.Clear;
+  FExplosions.Clear;
+  FTerrainHoles.Clear;
+  FProj.Active := False;
+  
+  W1 := TWorm.Create; W1.Pos := PointF(150, 400); W1.IsPlayer := True; W1.HP := 100; FWorms.Add(W1);
+  W2 := TWorm.Create; W2.Pos := PointF(Width - 150, 400); W2.IsPlayer := False; W2.HP := 100; FWorms.Add(W2);
+  
+  FCurrentWorm := 0;
+  RebuildTerrain;
+end;
+
+procedure TSkiaWormsGame.RebuildTerrain;
+var
+  PB: ISkPathBuilder;
+  X: Single;
+  H: Single;
+  Hole: TPointF;
+begin
+  // Generate a wavy island using a Path, then subtract holes (craters)
+  PB := TSkPathBuilder.Create;
+  // Start bottom left
+  PB.MoveTo(0, Height);
+  PB.LineTo(0, 450);
+  
+  // Top surface (wavy)
+  for X := 0 to Width do
+  begin
+    H := 450 + Sin(X / 100) * 20;
+    PB.LineTo(X, H);
+  end;
+  
+  PB.LineTo(Width, Height);
+  PB.Close;
+  
+  FTerrainPath := PB.Snapshot;
+  
+  // Subtract holes using Difference Op
+  if FTerrainHoles.Count > 0 then
+  begin
+    var HolePathBuilder := TSkPathBuilder.Create;
+    for Hole in FTerrainHoles do
+      HolePathBuilder.AddCircle(Hole.X, Hole.Y, Hole.Z);
+    
+    FTerrainPath := TSkPath.Op(FTerrainPath, HolePathBuilder.Snapshot, TSkPathOp.Difference);
+  end;
+end;
+
+function TSkiaWormsGame.IsPointInTerrain(P: TPointF): Boolean;
+begin
+  // Fast check: below screen or above ground line approx
+  if P.Y > Height then Exit(False);
+  if P.Y < 0 then Exit(False);
+  
+  // Precise check: Is point inside the terrain path?
+  Result := Assigned(FTerrainPath) and FTerrainPath.Contains(P);
+end;
+
+procedure TSkiaWormsGame.Explode(Pos: TPointF; Radius: Single);
+var
+  W: TWorm;
+  D: Single;
+begin
+  // Add hole to terrain
+  FTerrainHoles.Add(PointF(Pos.X, Pos.Y, Radius));
+  RebuildTerrain;
+  
+  // Damage Worms
+  for W in FWorms do
+  begin
+    if W.IsDead then Continue;
+    D := Hypot(W.Pos.X - Pos.X, W.Pos.Y - Pos.Y);
+    if D < Radius + 15 then
+    begin
+      W.HP := W.HP - Trunc(100 - D);
+      // Knockback
+      W.Pos.X := W.Pos.X + ((W.Pos.X - Pos.X) / D) * 30;
+      W.Pos.Y := W.Pos.Y - 20; // Pop up
+      if W.HP <= 0 then W.IsDead := True;
+    end;
+  end;
+  
+  // Visual Explosion
+  FExplosions.Add(PointF(Pos.X, Pos.Y, Radius));
+  
+  NextTurn;
+end;
+
+procedure TSkiaWormsGame.NextTurn;
+begin
+  FProj.Active := False;
+  FCurrentWorm := (FCurrentWorm + 1) mod FWorms.Count;
+  if FWorms[FCurrentWorm].IsDead then NextTurn; // Skip dead worms
+  
+  // Simple AI
+  if not FWorms[FCurrentWorm].IsPlayer then
+  begin
+    TThread.CreateAnonymousThread(
+      procedure
+      var Angle, Power: Single;
+      begin
+        Sleep(1000);
+        // AI shoots randomly towards player
+        Angle := DegToRad(-45 + Random(20));
+        Power := 300 + Random(100);
+        FProj.Pos := FWorms[1].Pos;
+        FProj.Vel := TPointF.Create(Cos(Angle) * Power, Sin(Angle) * Power);
+        FProj.Active := True;
+      end).Start;
+  end;
+end;
+
+procedure TSkiaWormsGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  W: TWorm;
+  I: Integer;
+  E: TPointF;
+begin
+  if not FActive then Exit;
+
+  // Update Explosions
+  for I := FExplosions.Count - 1 downto 0 do
+  begin
+    E := FExplosions[I];
+    E.Z := E.Z - DeltaSec * 100; // Shrink radius
+    if E.Z <= 0 then FExplosions.Delete(I) else FExplosions[I] := E;
+  end;
+
+  // Worm Gravity
+  for W in FWorms do
+  begin
+    if W.IsDead then Continue;
+    if not IsPointInTerrain(PointF(W.Pos.X, W.Pos.Y + 15)) then
+      W.Pos.Y := W.Pos.Y + 150 * DeltaSec;
+  end;
+
+  // Projectile Physics
+  if FProj.Active then
+  begin
+    FProj.Vel.Y := FProj.Vel.Y + GRAVITY * DeltaSec;
+    FProj.Pos := FProj.Pos + TPointF.Create(FProj.Vel.X * DeltaSec, FProj.Vel.Y * DeltaSec);
+    
+    // Out of bounds
+    if (FProj.Pos.X < 0) or (FProj.Pos.X > Width) or (FProj.Pos.Y > Height) then
+      NextTurn
+    // Hit terrain
+    else if IsPointInTerrain(FProj.Pos) then
+      Explode(FProj.Pos, 40);
+  end;
+end;
+
+procedure TSkiaWormsGame.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+begin
+  if Button = TMouseButton.mbLeft then
+  begin
+    if (FCurrentWorm = 0) and not FProj.Active then
+    begin
+      FIsAiming := True;
+      FAimStart := FWorms[0].Pos;
+      FAimCurrent := PointF(X, Y);
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaWormsGame.MouseMove(Shift: TShiftState; X, Y: Single);
+begin
+  if FIsAiming then
+    FAimCurrent := PointF(X, Y);
+  inherited;
+end;
+
+procedure TSkiaWormsGame.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  Drag: TPointF;
+begin
+  if FIsAiming then
+  begin
+    FIsAiming := False;
+    Drag := FAimStart - FAimCurrent;
+    FProj.Pos := FWorms[0].Pos;
+    FProj.Vel := Drag * 3.0; // Power based on drag distance
+    FProj.Active := True;
+  end;
+  inherited;
+end;
+
+procedure TSkiaWormsGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF87CEEB); // Sky
+  
+  DrawTerrain(ACanvas);
+  DrawWorms(ACanvas);
+  DrawProjectile(ACanvas);
+  DrawAiming(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaWormsGame.DrawTerrain(const ACanvas: ISkCanvas);
+var
+  Paint, Glow: ISkPaint;
+  E: TPointF;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF8B4513; // Dirt
+  if Assigned(FTerrainPath) then ACanvas.DrawPath(FTerrainPath, Paint);
+  
+  // Grass overlay (just a thick line on top)
+  Paint.Color := $FF228B22;
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 8;
+  if Assigned(FTerrainPath) then ACanvas.DrawPath(FTerrainPath, Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+  
+  // Explosions
+  for E in FExplosions do
+  begin
+    Glow := TSkPaint.Create(Paint);
+    Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 10.0);
+    Glow.Color := $FFFF8800;
+    ACanvas.DrawCircle(PointF(E.X, E.Y), E.Z, Glow);
+    Paint.Color := $FFFFFF00;
+    ACanvas.DrawCircle(PointF(E.X, E.Y), E.Z * 0.5, Paint);
+  end;
+end;
+
+procedure TSkiaWormsGame.DrawWorms(const ACanvas: ISkCanvas);
+var
+  W: TWorm;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for W in FWorms do
+  begin
+    if W.IsDead then Continue;
+    if W.IsPlayer then Paint.Color := $FF0000FF else Paint.Color := $FFFF0000;
+    ACanvas.DrawCircle(W.Pos, 12, Paint);
+    
+    Paint.Color := $FFFFFFFF;
+    ACanvas.DrawCircle(PointF(W.Pos.X - 4, W.Pos.Y - 4), 2, Paint); // Eye
+  end;
+end;
+
+procedure TSkiaWormsGame.DrawProjectile(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  if not FProj.Active then Exit;
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF111111;
+  ACanvas.DrawCircle(FProj.Pos, 5, Paint);
+end;
+
+procedure TSkiaWormsGame.DrawAiming(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  I: Integer;
+  T, Px, Py, Vx, Vy: Single;
+begin
+  if not FIsAiming then Exit;
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFFFFFF;
+  
+  // Dotted Trajectory
+  Vx := (FAimStart.X - FAimCurrent.X) * 3.0;
+  Vy := (FAimStart.Y - FAimCurrent.Y) * 3.0;
+  for I := 1 to 30 do
+  begin
+    T := I * 0.05;
+    Px := FAimStart.X + Vx * T;
+    Py := FAimStart.Y + Vy * T + 0.5 * GRAVITY * T * T;
+    if Py > Height - 20 then Break;
+    if I mod 2 = 0 then
+      ACanvas.DrawCircle(PointF(Px, Py), 2, Paint);
+  end;
+  
+  // Slingshot line
+  Paint.Color := $FFFF0000;
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 2;
+  ACanvas.DrawLine(FAimStart, FAimCurrent, Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+end;
+
+procedure TSkiaWormsGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('Drag from Blue Worm to aim and shoot!', 10, 30, Font, Paint);
+    
+    if FWorms[0].IsDead then
+      ACanvas.DrawSimpleText('RED WINS! (Click to Restart)', 10, 50, Font, Paint)
+    else if FWorms[1].IsDead then
+      ACanvas.DrawSimpleText('BLUE WINS! (Click to Restart)', 10, 50, Font, Paint)
+    else if FCurrentWorm = 0 then
+      ACanvas.DrawSimpleText('Blue''s Turn', 10, 50, Font, Paint)
+    else
+      ACanvas.DrawSimpleText('Red''s Turn', 10, 50, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaWormsGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaWormsGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaWormsGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

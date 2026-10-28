@@ -1,0 +1,494 @@
+{*******************************************************************************
+  SkiaCutTheRope (Touch Physics Prototype)
+********************************************************************************
+  A drag-and-cut prototype inspired by Cut the Rope. Features multi-node rope 
+  physics (Verlet integration), cuttable constraints, and gravity physics.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaCutTheRope;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 800;
+
+type
+  TRopeNode = class
+  public
+    Pos: TPointF;
+    OldPos: TPointF;
+    Pinned: Boolean;
+    IsCut: Boolean;
+  end;
+
+  TRopeLink = record
+    Node1: TRopeNode;
+    Node2: TRopeNode;
+    RestLength: Single;
+    Active: Boolean;
+  end;
+
+  TSkiaCutTheRopeGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    
+    FNodes: TObjectList<TRopeNode>;
+    FLinks: TList<TRopeLink>;
+    FDragNode: TRopeNode;
+    
+    FCandyPos, FCandyOldPos: TPointF;
+    FIsEaten: Boolean;
+    FWinTimer: Single;
+    
+    procedure InitLevel;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure ApplyConstraints;
+    procedure DrawRope(const ACanvas: ISkCanvas);
+    procedure DrawCandy(const ACanvas: ISkCanvas);
+    procedure DrawScissorsAndMouth(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Single); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaCutTheRopeGame }
+
+constructor TSkiaCutTheRopeGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FNodes := TObjectList<TRopeNode>.Create(True);
+  FLinks := TList<TRopeLink>.Create;
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaCutTheRopeGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FNodes);
+  FreeAndNil(FLinks);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaCutTheRopeGame.InitLevel;
+var
+  Anchor, N1, N2: TRopeNode;
+  Link: TRopeLink;
+begin
+  FNodes.Clear;
+  FLinks.Clear;
+  FIsEaten := False;
+  FWinTimer := 0;
+
+  // Create Rope: Anchor -> Node -> Node -> Candy
+  Anchor := TRopeNode.Create; Anchor.Pos := PointF(Width / 2, 50); Anchor.OldPos := Anchor.Pos; Anchor.Pinned := True; FNodes.Add(Anchor);
+  N1 := TRopeNode.Create; N1.Pos := PointF(Width / 2, 100); N1.OldPos := N1.Pos; FNodes.Add(N1);
+  N2 := TRopeNode.Create; N2.Pos := PointF(Width / 2, 150); N2.OldPos := N2.Pos; FNodes.Add(N2);
+
+  // The Candy acts as the last node
+  FCandyPos := PointF(Width / 2, 200);
+  FCandyOldPos := FCandyPos;
+
+  // Connect them
+  Link.Node1 := Anchor; Link.Node2 := N1; Link.RestLength := 50; Link.Active := True; FLinks.Add(Link);
+  Link.Node1 := N1; Link.Node2 := N2; Link.RestLength := 50; Link.Active := True; FLinks.Add(Link);
+  // Link to Candy (We use a dummy node for Candy logic, so we just link to N2)
+end;
+
+procedure TSkiaCutTheRopeGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  I: Integer;
+  Node: TRopeNode;
+  VX, VY: Single;
+begin
+  if not FActive then Exit;
+
+  if FIsEaten then
+  begin
+    FWinTimer := FWinTimer - DeltaSec;
+    if FWinTimer <= 0 then InitLevel;
+    Exit;
+  end;
+
+  // 1. Verlet Integration for Nodes
+  for I := 0 to FNodes.Count - 1 do
+  begin
+    Node := FNodes[I];
+    if Node.Pinned or (Node = FDragNode) then Continue;
+    
+    VX := (Node.Pos.X - Node.OldPos.X) * 0.99;
+    VY := (Node.Pos.Y - Node.OldPos.Y) * 0.99;
+    Node.OldPos := Node.Pos;
+    Node.Pos.X := Node.Pos.X + VX;
+    Node.Pos.Y := Node.Pos.Y + VY + GRAVITY * DeltaSec * DeltaSec;
+  end;
+
+  // 2. Verlet for Candy
+  if FDragNode = nil then // Only apply gravity if candy isn't dragged
+  begin
+    VX := (FCandyPos.X - FCandyOldPos.X) * 0.99;
+    VY := (FCandyPos.Y - FCandyOldPos.Y) * 0.99;
+    FCandyOldPos := FCandyPos;
+    FCandyPos.X := FCandyPos.X + VX;
+    FCandyPos.Y := FCandyPos.Y + VY + GRAVITY * DeltaSec * DeltaSec;
+  end;
+
+  // 3. Apply Constraints
+  for I := 0 to 4 do ApplyConstraints;
+
+  // 4. Check Win Condition (Candy hits the Mouth)
+  if Hypot(FCandyPos.X - (Width - 100), FCandyPos.Y - (Height - 100)) < 40 then
+  begin
+    FIsEaten := True;
+    FWinTimer := 2.0;
+  end;
+end;
+
+procedure TSkiaCutTheRopeGame.ApplyConstraints;
+var
+  I: Integer;
+  Link: TRopeLink;
+  DX, DY, Dist, Diff, OffX, OffY: Single;
+  CandyNode: TRopeNode; // Dummy to connect rope to candy
+begin
+  // Connect last node to Candy
+  if FNodes.Count > 0 then
+  begin
+    CandyNode := TRopeNode.Create; // Temp wrapper for candy
+    try
+      CandyNode.Pos := FCandyPos;
+      CandyNode.OldPos := FCandyOldPos;
+      Link.Node1 := FNodes[FNodes.Count-1];
+      Link.Node2 := CandyNode;
+      Link.RestLength := 50;
+      Link.Active := True;
+      ApplyConstraintsForLink(Link); // Apply math for Candy
+      FCandyPos := CandyNode.Pos; // Write back
+    finally
+      CandyNode.Free;
+    end;
+  end;
+
+  // Normal Rope Links
+  for I := 0 to FLinks.Count - 1 do
+  begin
+    Link := FLinks[I];
+    if Link.Active then
+      ApplyConstraintsForLink(Link);
+  end;
+end;
+
+// Extracted to method to reuse for Candy dummy node
+procedure TSkiaCutTheRopeGame.ApplyConstraintsForLink(Link: TRopeLink);
+var
+  DX, DY, Dist, Diff, OffX, OffY: Single;
+begin
+  DX := Link.Node2.Pos.X - Link.Node1.Pos.X;
+  DY := Link.Node2.Pos.Y - Link.Node1.Pos.Y;
+  Dist := Hypot(DX, DY);
+  if Dist = 0 then Dist := 0.0001;
+  
+  Diff := (Dist - Link.RestLength) / Dist;
+  OffX := DX * 0.5 * Diff * 0.8; // Stiffness
+  OffY := DY * 0.5 * Diff * 0.8;
+  
+  if not Link.Node1.Pinned and (Link.Node1 <> FDragNode) then
+  begin
+    Link.Node1.Pos.X := Link.Node1.Pos.X + OffX;
+    Link.Node1.Pos.Y := Link.Node1.Pos.Y + OffY;
+  end;
+  if not Link.Node2.Pinned and (Link.Node2 <> FDragNode) then
+  begin
+    Link.Node2.Pos.X := Link.Node2.Pos.X - OffX;
+    Link.Node2.Pos.Y := Link.Node2.Pos.Y - OffY;
+  end;
+end;
+
+procedure TSkiaCutTheRopeGame.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  I: Integer;
+  Node: TRopeNode;
+  Link: TRopeLink;
+begin
+  if Button = TMouseButton.mbLeft then
+  begin
+    // 1. Check Scissors (Click to cut)
+    if Hypot(X - 200, Y - 150) < 30 then
+    begin
+      for I := 0 to FLinks.Count - 1 do
+      begin
+        Link := FLinks[I];
+        // Simple check: if link is near scissors, cut it
+        if (Link.Node1.Pos.X < 250) and (Link.Node2.Pos.X < 250) then
+          Link.Active := False;
+      end;
+      Exit;
+    end;
+    
+    // 2. Check Candy (Drag)
+    if Hypot(X - FCandyPos.X, Y - FCandyPos.Y) < 30 then
+    begin
+      FDragNode := TRopeNode.Create; // Dummy node representing dragged candy
+      FDragNode.Pos := FCandyPos;
+      Exit;
+    end;
+    
+    // 3. Check Rope Nodes (Drag)
+    for I := 0 to FNodes.Count - 1 do
+    begin
+      Node := FNodes[I];
+      if Hypot(X - Node.Pos.X, Y - Node.Pos.Y) < 20 then
+      begin
+        FDragNode := Node;
+        Break;
+      end;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaCutTheRopeGame.MouseMove(Shift: TShiftState; X, Y: Single);
+begin
+  if Assigned(FDragNode) then
+  begin
+    FDragNode.Pos := PointF(X, Y);
+    FDragNode.OldPos := PointF(X, Y); // Prevent slingshot
+    if FDragNode <> FNodes[0] then // If dragging candy
+      FCandyPos := PointF(X, Y);
+  end;
+  inherited;
+end;
+
+procedure TSkiaCutTheRopeGame.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  I: Integer;
+begin
+  // If we dragged the candy, we need to sync the candy's pos and oldpos
+  if Assigned(FDragNode) and (FDragNode <> FNodes[0]) then
+  begin
+    // Find if FDragNode is actually part of FNodes. If not, it's candy.
+    if FNodes.IndexOf(FDragNode) = -1 then
+    begin
+      FCandyPos := FDragNode.Pos;
+      FCandyOldPos := FDragNode.OldPos;
+      FreeAndNil(FDragNode); // It was a dummy
+    end;
+  end;
+  FDragNode := nil;
+  inherited;
+end;
+
+procedure TSkiaCutTheRopeGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF1A5276); // Wooden BG
+  
+  DrawRope(ACanvas);
+  DrawCandy(ACanvas);
+  DrawScissorsAndMouth(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaCutTheRopeGame.DrawRope(const ACanvas: ISkCanvas);
+var
+  I: Integer;
+  Link: TRopeLink;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.AntiAlias := True;
+  Paint.StrokeWidth := 4;
+  Paint.StrokeCap := TSkStrokeCap.Round;
+  
+  for I := 0 to FLinks.Count - 1 do
+  begin
+    Link := FLinks[I];
+    if Link.Active then
+    begin
+      Paint.Color := $FFD2B48C; // Tan rope
+      ACanvas.DrawLine(Link.Node1.Pos, Link.Node2.Pos, Paint);
+    end;
+  end;
+  
+  // Draw Nodes (Knots)
+  Paint.Style := TSkPaintStyle.Fill;
+  for I := 0 to FNodes.Count - 1 do
+  begin
+    if FNodes[I].Pinned then
+      Paint.Color := $FF8B4513 // Brown anchor
+    else
+      Paint.Color := $FFA0522D; // Knots
+    ACanvas.DrawCircle(FNodes[I].Pos, 6, Paint);
+  end;
+end;
+
+procedure TSkiaCutTheRopeGame.DrawCandy(const ACanvas: ISkCanvas);
+var
+  Paint, Glow: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFF4500; // Orange/Red Candy
+  
+  Glow := TSkPaint.Create(Paint);
+  Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 6.0);
+  Glow.Color := $FFFF8C00;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(FCandyPos.X-20, FCandyPos.Y+20, FCandyPos.X+20, FCandyPos.Y+28), Paint);
+  Paint.Alpha := 255;
+  
+  // Body
+  ACanvas.DrawCircle(FCandyPos, 20, Glow);
+  ACanvas.DrawCircle(FCandyPos, 20, Paint);
+  
+  // Star on Candy
+  Paint.Color := $FFFFFF00;
+  ACanvas.DrawCircle(FCandyPos, 8, Paint);
+end;
+
+procedure TSkiaCutTheRopeGame.DrawScissorsAndMouth(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Scissors (Top Left)
+  Paint.Color := $FFCCCCCC;
+  ACanvas.DrawCircle(PointF(200, 150), 20, Paint);
+  Paint.Color := $FF111111;
+  ACanvas.DrawCircle(PointF(200, 150), 10, Paint);
+  
+  // Monster Mouth (Bottom Right)
+  Paint.Color := $FF006400; // Dark Green Body
+  ACanvas.DrawCircle(PointF(Width - 100, Height - 100), 40, Paint);
+  
+  if FIsEaten then
+  begin
+    Paint.Color := $FF8B0000; // Red inside when eating
+    ACanvas.DrawCircle(PointF(Width - 100, Height - 100), 20, Paint);
+  end
+  else
+  begin
+    Paint.Color := $FF000000; // Black open mouth
+    ACanvas.DrawCircle(PointF(Width - 100, Height - 100), 20, Paint);
+    // Eyes
+    Paint.Color := $FFFFFFFF;
+    ACanvas.DrawCircle(PointF(Width - 110, Height - 110), 5, Paint);
+    ACanvas.DrawCircle(PointF(Width - 90, Height - 110), 5, Paint);
+  end;
+end;
+
+procedure TSkiaCutTheRopeGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+  Txt: string;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    
+    if FIsEaten then
+    begin
+      Txt := 'YUM! Resetting...';
+      Paint.Color := TAlphaColors.Yellow;
+    end
+    else
+    begin
+      Txt := 'Drag the Candy OR Click the Scissors to cut the rope!';
+      Paint.Color := TAlphaColors.White;
+    end;
+    
+    ACanvas.DrawSimpleText(Txt, 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaCutTheRopeGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaCutTheRopeGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaCutTheRopeGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

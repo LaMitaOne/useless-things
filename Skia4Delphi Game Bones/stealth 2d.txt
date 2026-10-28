@@ -1,0 +1,537 @@
+{*******************************************************************************
+  SkiaStealth (2D Top-Down Stealth Prototype)
+********************************************************************************
+  A top-down stealth prototype inspired by Metal Gear Solid.
+  Features Field of View (FOV) raycasting against walls, vision cones, 
+  noise radiuses, and basic enemy alert states.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaStealth;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TWall = record
+    Rect: TRectF;
+  end;
+
+  TEnemyState = (esPatrol, esAlert, esSearch);
+
+  TEnemy = class
+  public
+    Pos: TPointF;
+    Angle: Single;
+    FOVAngle: Single; // In Degrees (e.g., 60)
+    ViewDist: Single;
+    State: TEnemyState;
+    AlertTimer: Single;
+    PatrolDir: Integer;
+  end;
+
+  TSkiaStealthGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FPlayer: TPointF;
+    FIsCrouching: Boolean;
+    FIsCaught: Boolean;
+    
+    FEnemies: TObjectList<TEnemy>;
+    FWalls: TList<TWall>;
+    
+    procedure InitLevel;
+    procedure DoLogicUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    function IsPointInVision(Enemy: TEnemy; Point: TPointF): Boolean;
+    function RayHitsWall(P1, P2: TPointF): Boolean;
+    function CanMoveTo(X, Y: Single): Boolean;
+    
+    procedure DrawWalls(const ACanvas: ISkCanvas);
+    procedure DrawVisionCones(const ACanvas: ISkCanvas);
+    procedure DrawPlayer(const ACanvas: ISkCanvas);
+    procedure DrawEnemies(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaStealthGame }
+
+constructor TSkiaStealthGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FEnemies := TObjectList<TEnemy>.Create(True);
+  FWalls := TList<TWall>.Create;
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaStealthGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FEnemies);
+  FreeAndNil(FWalls);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaStealthGame.InitLevel;
+var
+  W: TWall;
+  En: TEnemy;
+begin
+  FPlayer := PointF(100, 400);
+  FIsCrouching := False;
+  FIsCaught := False;
+  FWalls.Clear;
+  FEnemies.Clear;
+
+  // Border Walls
+  W.Rect := TRectF.Create(0, 0, 800, 20); FWalls.Add(W);
+  W.Rect := TRectF.Create(0, 580, 800, 600); FWalls.Add(W);
+  W.Rect := TRectF.Create(0, 0, 20, 600); FWalls.Add(W);
+  W.Rect := TRectF.Create(780, 0, 800, 600); FWalls.Add(W);
+
+  // Inner Walls
+  W.Rect := TRectF.Create(200, 100, 250, 400); FWalls.Add(W);
+  W.Rect := TRectF.Create(400, 200, 600, 250); FWalls.Add(W);
+  W.Rect := TRectF.Create(500, 350, 550, 550); FWalls.Add(W);
+
+  // Enemy 1 (Patrolling)
+  En := TEnemy.Create;
+  En.Pos := PointF(400, 100);
+  En.Angle := 90; // Looking Down
+  En.FOVAngle := 60;
+  En.ViewDist := 250;
+  En.State := esPatrol;
+  En.PatrolDir := 1;
+  FEnemies.Add(En);
+  
+  // Enemy 2
+  En := TEnemy.Create;
+  En.Pos := PointF(700, 400);
+  En.Angle := 180; // Looking Left
+  En.FOVAngle := 50;
+  En.ViewDist := 200;
+  En.State := esPatrol;
+  En.PatrolDir := 1;
+  FEnemies.Add(En);
+end;
+
+function TSkiaStealthGame.CanMoveTo(X, Y: Single): Boolean;
+var
+  W: TWall;
+  PlayerRect: TRectF;
+begin
+  Result := False;
+  PlayerRect := TRectF.Create(X - 8, Y - 8, X + 8, Y + 8);
+  for W in FWalls do
+  begin
+    if PlayerRect.Intersects(W.Rect) then Exit;
+  end;
+  Result := True;
+end;
+
+function TSkiaStealthGame.RayHitsWall(P1, P2: TPointF): Boolean;
+var
+  W: TWall;
+  // Simple check: does line intersect rect? For prototype, we approximate 
+  // by checking points along the line.
+  I: Integer;
+  T, X, Y: Single;
+begin
+  Result := False;
+  for I := 1 to 10 do
+  begin
+    T := I / 10;
+    X := P1.X + (P2.X - P1.X) * T;
+    Y := P1.Y + (P2.Y - P1.Y) * T;
+    for W in FWalls do
+    begin
+      if W.Rect.Contains(PointF(X, Y)) then Exit(True);
+    end;
+  end;
+end;
+
+function TSkiaStealthGame.IsPointInVision(Enemy: TEnemy; Point: TPointF): Boolean;
+var
+  DX, DY, AngleToPlayer, AngleDiff: Single;
+begin
+  Result := False;
+  DX := Point.X - Enemy.Pos.X;
+  DY := Point.Y - Enemy.Pos.Y;
+  
+  // 1. Check Distance
+  if Hypot(DX, DY) > Enemy.ViewDist then Exit;
+  
+  // 2. Check Angle
+  AngleToPlayer := RadToDeg(ArcTan2(DY, DX));
+  AngleDiff := Abs(AngleToPlayer - Enemy.Angle);
+  // Normalize angle diff
+  while AngleDiff > 180 do AngleDiff := AngleDiff - 360;
+  AngleDiff := Abs(AngleDiff);
+  
+  if AngleDiff > (Enemy.FOVAngle / 2) then Exit;
+  
+  // 3. Check Walls (Raycasting)
+  if RayHitsWall(Enemy.Pos, Point) then Exit;
+  
+  Result := True;
+end;
+
+procedure TSkiaStealthGame.DoLogicUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  Spd: Single;
+  En: TEnemy;
+  I: Integer;
+  CanSeePlayer: Boolean;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    FIsCrouching := Byte(Ord('C')) in FKeys;
+  finally
+    FLock.Release;
+  end;
+
+  if FIsCaught then
+  begin
+    // Wait for reset
+    Sleep(3000);
+    InitLevel;
+    Exit;
+  end;
+
+  // Player Movement
+  Spd := 180;
+  if FIsCrouching then Spd := 80;
+  
+  if Left and CanMoveTo(FPlayer.X - Spd * DeltaSec, FPlayer.Y) then FPlayer.X := FPlayer.X - Spd * DeltaSec;
+  if Right and CanMoveTo(FPlayer.X + Spd * DeltaSec, FPlayer.Y) then FPlayer.X := FPlayer.X + Spd * DeltaSec;
+  if Up and CanMoveTo(FPlayer.X, FPlayer.Y - Spd * DeltaSec) then FPlayer.Y := FPlayer.Y - Spd * DeltaSec;
+  if Down and CanMoveTo(FPlayer.X, FPlayer.Y + Spd * DeltaSec) then FPlayer.Y := FPlayer.Y + Spd * DeltaSec;
+
+  // Enemy Logic
+  for I := 0 to FEnemies.Count - 1 do
+  begin
+    En := FEnemies[I];
+    CanSeePlayer := IsPointInVision(En, FPlayer);
+    
+    case En.State of
+      esPatrol: begin
+                  // Patrol movement (Left/Right)
+                  En.Pos.X := En.Pos.X + (En.PatrolDir * 50 * DeltaSec);
+                  if (En.Pos.X < 50) or (En.Pos.X > 750) then
+                    En.PatrolDir := En.PatrolDir * -1;
+                  
+                  // Sweep Angle
+                  En.Angle := En.Angle + (20 * DeltaSec);
+                  if En.Angle > 140 then En.Angle := 40;
+                  
+                  if CanSeePlayer then
+                  begin
+                    En.State := esAlert;
+                    En.AlertTimer := 3.0;
+                    FIsCaught := True; // BUSTED!
+                  end;
+                end;
+      esAlert: begin
+                 En.AlertTimer := En.AlertTimer - DeltaSec;
+                 if En.AlertTimer <= 0 then En.State := esPatrol;
+               end;
+    end;
+  end;
+end;
+
+procedure TSkiaStealthGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF1a1a1a); // Dark Facility
+  
+  DrawVisionCones(ACanvas);
+  DrawWalls(ACanvas);
+  DrawPlayer(ACanvas);
+  DrawEnemies(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaStealthGame.DrawWalls(const ACanvas: ISkCanvas);
+var
+  W: TWall;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF444444;
+  for W in FWalls do
+    ACanvas.DrawRect(W.Rect, Paint);
+    
+  Paint.Color := $FF666666;
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 2;
+  for W in FWalls do
+    ACanvas.DrawRect(W.Rect, Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+end;
+
+procedure TSkiaStealthGame.DrawVisionCones(const ACanvas: ISkCanvas);
+var
+  En: TEnemy;
+  Paint, Glow: ISkPaint;
+  PB: ISkPathBuilder;
+  I: Integer;
+  RayAngle, Rad, Rx, Ry: TPointF;
+  Step, CurDist: Single;
+  HitWall: Boolean;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Alpha := 80; // Semi-transparent
+  
+  for En in FEnemies do
+  begin
+    PB := TSkPathBuilder.Create;
+    PB.MoveTo(En.Pos.X, En.Pos.Y);
+    
+    // Raycast to draw the cone exactly to the walls
+    for I := -Trunc(En.FOVAngle/2) to Trunc(En.FOVAngle/2) do
+    begin
+      RayAngle := En.Angle + I;
+      Rad := DegToRad(RayAngle);
+      CurDist := 0;
+      HitWall := False;
+      
+      while (CurDist < En.ViewDist) and not HitWall do
+      begin
+        CurDist := CurDist + 10;
+        Rx := En.Pos.X + Cos(Rad) * CurDist;
+        Ry := En.Pos.Y + Sin(Rad) * CurDist;
+        HitWall := RayHitsWall(En.Pos, PointF(Rx, Ry));
+      end;
+      
+      PB.LineTo(Rx, Ry);
+    end;
+    PB.Close;
+    
+    if En.State = esAlert then
+      Paint.Color := $88FF0000 // Red Alert
+    else
+      Paint.Color := $88FFFF00; // Yellow Patrol
+      
+    ACanvas.DrawPath(PB.Snapshot, Paint);
+  end;
+end;
+
+procedure TSkiaStealthGame.DrawPlayer(const ACanvas: ISkCanvas);
+var
+  Paint, Glow: ISkPaint;
+  Radius: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Noise Radius (Only if not crouching)
+  if not FIsCrouching then
+  begin
+    Paint.Color := $33FFFFFF; // Very transparent white
+    ACanvas.DrawCircle(FPlayer, 60, Paint);
+  end;
+  
+  // Body
+  if FIsCrouching then
+  begin
+    Paint.Color := $FF0066FF; // Darker blue when crouching
+    Radius := 6;
+  end
+  else
+  begin
+    Paint.Color := $FF00AAFF;
+    Radius := 8;
+  end;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(FPlayer.X-Radius+2, FPlayer.Y+Radius-4, FPlayer.X+Radius+2, FPlayer.Y+Radius+2), Paint);
+  Paint.Alpha := 255;
+  
+  ACanvas.DrawCircle(FPlayer, Radius, Paint);
+end;
+
+procedure TSkiaStealthGame.DrawEnemies(const ACanvas: ISkCanvas);
+var
+  En: TEnemy;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for En in FEnemies do
+  begin
+    Paint.Color := $FF000000;
+    Paint.Alpha := 80;
+    ACanvas.DrawOval(TRectF.Create(En.Pos.X-8, En.Pos.Y+8, En.Pos.X+8, En.Pos.Y+12), Paint);
+    Paint.Alpha := 255;
+    
+    if En.State = esAlert then
+      Paint.Color := $FFFF0000
+    else
+      Paint.Color := $FFAA0000;
+      
+    ACanvas.DrawCircle(En.Pos, 8, Paint);
+  end;
+end;
+
+procedure TSkiaStealthGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    if FIsCaught then
+    begin
+      Paint.Color := $AAFF0000;
+      ACanvas.DrawRect(TRectF.Create(0, 0, Width, Height), Paint);
+      Paint.Color := TAlphaColors.White;
+      ACanvas.DrawSimpleText('!!! ALERT !!! YOU WERE SPOTTED!', Width/2 - 200, Height/2, Font, Paint);
+    end
+    else
+    begin
+      Paint.Color := TAlphaColors.White;
+      ACanvas.DrawSimpleText('WASD: Move | C: Crouch (reduce noise radius)', 10, 30, Font, Paint);
+      if FIsCrouching then
+      begin
+        Paint.Color := TAlphaColors.Cyan;
+        ACanvas.DrawSimpleText('[SNEAKING]', 10, 50, Font, Paint);
+      end;
+    end;
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaStealthGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      Byte(Ord('C')): Include(FKeys, Byte(Ord('C')));
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStealthGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      Byte(Ord('C')): Exclude(FKeys, Byte(Ord('C')));
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStealthGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaStealthGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoLogicUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaStealthGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

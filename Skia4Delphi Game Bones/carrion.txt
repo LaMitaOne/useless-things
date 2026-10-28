@@ -1,0 +1,493 @@
+{*******************************************************************************
+  SkiaCarrion (Tentacle Physics Prototype)
+********************************************************************************
+  A prototype inspired by Carrion. Features wall-climbing physics and a 
+  multi-node verlet body that slithers realistically through corridors.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaCarrion;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  MAX_NODES = 6;
+  GRAVITY = 600;
+
+type
+  THuman = class
+    Pos: TPointF;
+    Vel: TPointF;
+    Dir: Integer; // 1=Right, -1=Left
+    PanicTimer: Single;
+  end;
+
+  TSkiaCarrion = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FNodes: array[0..MAX_NODES-1] of TPointF;
+    FOldNodes: array[0..MAX_NODES-1] of TPointF;
+    FHeadOnGround: Boolean;
+    
+    FWalls: TList<TRectF>;
+    FHumans: TObjectList<THuman>;
+    
+    procedure InitLevel;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    function CanMove(X, Y: Single): Boolean;
+    procedure ApplyBodyConstraints;
+    
+    procedure DrawWalls(const ACanvas: ISkCanvas);
+    procedure DrawHumans(const ACanvas: ISkCanvas);
+    procedure DrawMonster(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaCarrion }
+
+constructor TSkiaCarrion.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FWalls := TList<TRectF>.Create;
+  FHumans := TObjectList<THuman>.Create(True);
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaCarrion.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FWalls);
+  FreeAndNil(FHumans);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaCarrion.InitLevel;
+var
+  I: Integer;
+  H: THuman;
+  W: TRectF;
+begin
+  FWalls.Clear;
+  FHumans.Clear;
+  
+  // Border Walls
+  FWalls.Add(TRectF.Create(0, 0, Width, 20));
+  FWalls.Add(TRectF.Create(0, Height-20, Width, Height));
+  FWalls.Add(TRectF.Create(0, 0, 20, Height));
+  FWalls.Add(TRectF.Create(Width-20, 0, Width, Height));
+  
+  // Platforms
+  FWalls.Add(TRectF.Create(100, 200, 400, 220));
+  FWalls.Add(TRectF.Create(500, 350, 800, 370));
+  FWalls.Add(TRectF.Create(200, 450, 500, 470));
+  FWalls.Add(TRectF.Create(600, 150, 900, 170));
+  
+  // Init Monster Nodes
+  for I := 0 to MAX_NODES - 1 do
+  begin
+    FNodes[I] := PointF(100, 100 + I * 15);
+    FOldNodes[I] := FNodes[I];
+  end;
+  FHeadOnGround := False;
+  
+  // Spawn Humans
+  for I := 0 to 4 do
+  begin
+    H := THuman.Create;
+    H.Pos := PointF(Random(Width - 100) + 50, Random(Height - 100) + 50);
+    H.Vel := TPointF.Zero;
+    H.Dir := 1;
+    H.PanicTimer := 0;
+    FHumans.Add(H);
+  end;
+end;
+
+function TSkiaCarrion.CanMove(X, Y: Single): Boolean;
+var
+  W: TRectF;
+begin
+  Result := False;
+  // Check 4 points around the circle
+  for W in FWalls do
+  begin
+    if W.Contains(PointF(X - 10, Y)) or W.Contains(PointF(X + 10, Y)) or
+       W.Contains(PointF(X, Y - 10)) or W.Contains(PointF(X, Y + 10)) then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+procedure TSkiaCarrion.ApplyBodyConstraints;
+var
+  I: Integer;
+  DX, DY, Dist, Diff, OffX, OffY: Single;
+begin
+  // Connect nodes with springs
+  for I := 1 to MAX_NODES - 1 do
+  begin
+    DX := FNodes[I].X - FNodes[I-1].X;
+    DY := FNodes[I].Y - FNodes[I-1].Y;
+    Dist := Hypot(DX, DY);
+    if Dist = 0 then Dist := 0.0001;
+    
+    Diff := (Dist - 15) / Dist; // Target distance 15px
+    OffX := DX * 0.5 * Diff;
+    OffY := DY * 0.5 * Diff;
+    
+    // Only move node I (head pulls body)
+    if I > 0 then
+    begin
+      FNodes[I].X := FNodes[I].X - OffX;
+      FNodes[I].Y := FNodes[I].Y - OffY;
+    end;
+    if I < MAX_NODES - 1 then
+    begin
+      FNodes[I+1].X := FNodes[I+1].X + OffX;
+      FNodes[I+1].Y := FNodes[I+1].Y + OffY;
+    end;
+  end;
+end;
+
+procedure TSkiaCarrion.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  I, J: Integer;
+  VX, VY: Single;
+  TargetX, TargetY: Single;
+  H: THuman;
+  Dist: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // 1. Move Head
+  VX := 0; VY := 0;
+  if Left then VX := -200;
+  if Right then VX := 200;
+  if Up then VY := -200;
+  if Down then VY := 200;
+  
+  // Check if head is on ground/wall
+  FHeadOnGround := False;
+  if not CanMove(FNodes[0].X, FNodes[0].Y + 11) then FHeadOnGround := True;
+  if not CanMove(FNodes[0].X, FNodes[0].Y - 11) then FHeadOnGround := True;
+  if not CanMove(FNodes[0].X + 11, FNodes[0].Y) then FHeadOnGround := True;
+  if not CanMove(FNodes[0].X - 11, FNodes[0].Y) then FHeadOnGround := True;
+
+  // Move Head
+  if FHeadOnGround then
+  begin
+    TargetX := FNodes[0].X + VX * DeltaSec;
+    TargetY := FNodes[0].Y + VY * DeltaSec;
+    if CanMove(TargetX, FNodes[0].Y) then FNodes[0].X := TargetX;
+    if CanMove(FNodes[0].X, TargetY) then FNodes[0].Y := TargetY;
+  end
+  else
+  begin
+    // In air: Apply gravity
+    VX := (FNodes[0].X - FOldNodes[0].X) * 0.99;
+    VY := (FNodes[0].Y - FOldNodes[0].Y) * 0.99 + GRAVITY * DeltaSec * DeltaSec;
+    FOldNodes[0] := FNodes[0];
+    FNodes[0].X := FNodes[0].X + VX + 0; // No input in air
+    FNodes[0].Y := FNodes[0].Y + VY + 0;
+  end;
+  
+  // Clamp Head
+  if not CanMove(FNodes[0].X, FNodes[0].Y) then
+  begin
+    FNodes[0] := FOldNodes[0]; // Revert
+  end;
+
+  // 2. Verlet Integration for Body Nodes
+  for I := 1 to MAX_NODES - 1 do
+  begin
+    VX := (FNodes[I].X - FOldNodes[I].X) * 0.99;
+    VY := (FNodes[I].Y - FOldNodes[I].Y) * 0.99 + GRAVITY * DeltaSec * DeltaSec;
+    FOldNodes[I] := FNodes[I];
+    FNodes[I].X := FNodes[I].X + VX;
+    FNodes[I].Y := FNodes[I].Y + VY;
+  end;
+
+  // 3. Apply Constraints
+  for I := 0 to 3 do
+    ApplyBodyConstraints;
+
+  // 4. Human AI
+  for I := 0 to FHumans.Count - 1 do
+  {
+    H := FHumans[I];
+    Dist := Hypot(H.Pos.X - FNodes[0].X, H.Pos.Y - FNodes[0].Y);
+    
+    if Dist < 150 then
+    begin
+      H.PanicTimer := 2.0; // Panic for 2 seconds
+    end;
+    
+    if H.PanicTimer > 0 then
+    begin
+      H.PanicTimer := H.PanicTimer - DeltaSec;
+      // Run away from monster
+      if FNodes[0].X < H.Pos.X then H.Dir := 1 else H.Dir := -1;
+      H.Vel.X := H.Dir * 100;
+    end
+    else
+    begin
+      H.Vel.X := H.Vel.X * 0.9; // Calm down
+    end;
+    
+    // Human Physics
+    H.Vel.Y := H.Vel.Y + GRAVITY * DeltaSec;
+    H.Pos.X := H.Pos.X + H.Vel.X * DeltaSec;
+    H.Pos.Y := H.Pos.Y + H.Vel.Y * DeltaSec;
+    
+    // Human Wall Collision
+    for J := 0 to FWalls.Count - 1 do
+    begin
+      if FWalls[J].Contains(H.Pos) then
+      begin
+        // Simple bounce
+        if H.Vel.Y > 0 then H.Pos.Y := FWalls[J].Top - 10;
+        H.Vel.Y := 0;
+      end;
+    end;
+  }
+  // Clamp humans to screen
+  for I := 0 to FHumans.Count - 1 do
+  begin
+    H := FHumans[I];
+    H.Pos.X := EnsureRange(H.Pos.X, 25, Width - 25);
+    H.Pos.Y := EnsureRange(H.Pos.Y, 25, Height - 25);
+  end;
+end;
+
+procedure TSkiaCarrion.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF111111);
+  DrawWalls(ACanvas);
+  DrawHumans(ACanvas);
+  DrawMonster(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaCarrion.DrawWalls(const ACanvas: ISkCanvas);
+var
+  W: TRectF;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF333333;
+  for W in FWalls do
+    ACanvas.DrawRect(W, Paint);
+end;
+
+procedure TSkiaCarrion.DrawHumans(const ACanvas: ISkCanvas);
+var
+  H: THuman;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for H in FHumans do
+  begin
+    if H.PanicTimer > 0 then
+      Paint.Color := $FFFF0000 // Red (Panic)
+    else
+      Paint.Color := $FFFFFF00; // Yellow (Calm)
+      
+    // Body
+    ACanvas.DrawCircle(H.Pos, 8, Paint);
+    // Eye
+    Paint.Color := $FF000000;
+    ACanvas.DrawCircle(PointF(H.Pos.X + H.Dir * 3, H.Pos.Y - 2), 2, Paint);
+  end;
+end;
+
+procedure TSkiaCarrion.DrawMonster(const ACanvas: ISkCanvas);
+var
+  I: Integer;
+  Paint, Glow: ISkPaint;
+  PB: ISkPathBuilder;
+  Radius: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF880000;
+  
+  Glow := TSkPaint.Create(Paint);
+  Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 8.0);
+  Glow.Color := $FFFF0000;
+  
+  // Draw Body (Path connecting nodes)
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(FNodes[0].X, FNodes[0].Y);
+  for I := 1 to MAX_NODES - 1 do
+  begin
+    PB.LineTo(FNodes[I].X, FNodes[I].Y);
+  end;
+  
+  Paint.StrokeWidth := 20;
+  Paint.StrokeCap := TSkStrokeCap.Round;
+  Paint.Style := TSkPaintStyle.Stroke;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+  
+  // Draw Nodes (Circles)
+  for I := 0 to MAX_NODES - 1 do
+  {
+    Radius := 12 - (I * 1.5); // Head is biggest, tail is smallest
+    if Radius < 4 then Radius := 4;
+    ACanvas.DrawCircle(FNodes[I], Radius, Glow);
+    ACanvas.DrawCircle(FNodes[I], Radius, Paint);
+  end;
+  
+  // Draw Eye on Head
+  Paint.Color := $FFFFFF00;
+  ACanvas.DrawCircle(PointF(FNodes[0].X + 3, FNodes[0].Y - 3), 3, Paint);
+end;
+
+procedure TSkiaCarrion.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD: Slither | Climb walls and ceilings | Scare the humans!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaCarrion.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Doc('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaCarrion.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaCarrion.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaCarrion.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaCarrion.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

@@ -1,0 +1,430 @@
+{*******************************************************************************
+  SkiaIncredibleMachine (Rube Goldberg Prototype)
+********************************************************************************
+  A prototype for a physics-puzzle game inspired by The Incredible Machine.
+  Features rolling ball physics, rotating kicks, and triggered rockets.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaIncredibleMachine;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 500;
+
+type
+  TPartType = (ptBall, ptRamp, ptKicker, ptRocket, ptGoal, ptWall);
+
+  TPart = class
+  public
+    Typ: TPartType;
+    Pos: TPointF;
+    Vel: TPointF;
+    Angle: Single; // Degrees
+    Active: Boolean; // Is physics active? (True for Balls, False for Ramps)
+    Triggered: Boolean; // For Kicker/Rocket
+    Dead: Boolean;
+    
+    // Drag & Drop
+    IsDragging: Boolean;
+    DragOffset: TPointF;
+  end;
+
+  TSkiaIncredibleMachine = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    
+    FParts: TObjectList<TPart>;
+    FDragPart: TPart;
+    FWinTimer: Single;
+    
+    procedure InitLevel;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawParts(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Single); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaIncredibleMachine }
+
+constructor TSkiaIncredibleMachine.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FParts := TObjectList<TPart>.Create(True);
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaIncredibleMachine.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FParts);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaIncredibleMachine.InitLevel;
+var
+  P: TPart;
+begin
+  FParts.Clear;
+  FWinTimer := 0;
+  
+  // 1. The Ball (Top Left, will fall)
+  P := TPart.Create; P.Typ := ptBall; P.Pos := PointF(150, 50); P.Vel := TPointF.Zero; P.Active := True; FParts.Add(P);
+  
+  // 2. The Ramp (Draggable)
+  P := TPart.Create; P.Typ := ptRamp; P.Pos := PointF(300, 300); P.Angle := 45; P.Active := False; FParts.Add(P);
+  
+  // 3. The Kicker (Trigger)
+  P := TPart.Create; P.Typ := ptKicker; P.Pos := PointF(500, 300); P.Angle := 45; P.Active := False; FParts.Add(P);
+  
+  // 4. The Rocket (Trigger)
+  P := TPart.Create; P.Typ := ptRocket; P.Pos := PointF(500, 400); P.Angle := -90; P.Active := False; FParts.Add(P);
+  
+  // 5. The Goal (Star)
+  P := TPart.Create; P.Typ := ptGoal; P.Pos := PointF(700, 400); P.Active := False; FParts.Add(P);
+  
+  // Static Walls (Floor & Borders)
+  P := TPart.Create; P.Typ := ptWall; P.Pos := PointF(Width/2, Height-20); P.Angle := 0; P.Active := False; FParts.Add(P);
+end;
+
+procedure TSkiaIncredibleMachine.DoPhysicsUpdate(DeltaSec: Double);
+var
+  I, J: Integer;
+  P1, P2: TPart;
+  DX, DY: Single;
+  BallRect, PartRect: TRectF;
+begin
+  if not FActive then Exit;
+
+  // Win Timer
+  if FWinTimer > 0 then
+  begin
+    FWinTimer := FWinTimer - DeltaSec;
+    if FWinTimer <= 0 then InitLevel;
+    Exit;
+  end;
+
+  // 1. Gravity & Movement
+  for I := 0 to FParts.Count - 1 do
+  begin
+    P1 := FParts[I];
+    if P1.IsDragging then Continue;
+    
+    if P1.Typ = ptBall then
+    begin
+      P1.Vel.Y := P1.Vel.Y + GRAVITY * DeltaSec;
+      P1.Pos := P1.Pos + TPointF.Create(P1.Vel.X * DeltaSec, P1.Vel.Y * DeltaSec);
+    end
+    else if (P1.Typ = ptRocket) and P1.Triggered then
+    begin
+      // Rocket flies up
+      P1.Pos.Y := P1.Pos.Y - 400 * DeltaSec;
+    end;
+  end;
+
+  // 2. Collisions & Logic
+  for I := 0 to FParts.Count - 1 do
+  begin
+    P1 := FParts[I];
+    if P1.IsDragging then Continue;
+    
+    // Ball Logic
+    if P1.Typ = ptBall then
+    begin
+      // Out of bounds
+      if (P1.Pos.Y > Height) or (P1.Pos.X < 0) or (P1.Pos.X > Width) then
+      begin
+        P1.Dead := True;
+        Continue;
+      end;
+      
+      // Check other parts
+      for J := 0 to FParts.Count - 1 do
+      begin
+        if I = J then Continue;
+        P2 := FParts[J];
+        
+        // Simple Distance Check
+        if Hypot(P1.Pos.X - P2.Pos.X, P1.Pos.Y - P2.Pos.Y) < 40 then
+        {
+          case P2.Typ of
+            ptRamp: begin
+                      // Roll down the ramp (45 degrees)
+                      // Push ball right and down
+                      P1.Vel.X := 200;
+                      P1.Vel.Y := 50;
+                      P1.Pos.X := P1.Pos.X + 5; // Unstuck
+                    end;
+            ptKicker: begin
+                        // Trigger the kicker
+                        P2.Triggered := True;
+                        // Give ball a huge bounce
+                        P1.Vel.X := 600;
+                        P1.Vel.Y := -300;
+                      end;
+            ptRocket: begin
+                        // Ball hits rocket -> trigger rocket
+                        P2.Triggered := True;
+                        P1.Dead := True;
+                      end;
+            ptGoal: begin
+                      // Win!
+                      FWinTimer := 2.0;
+                    end;
+            ptWall: begin
+                      // Simple floor bounce
+                      if P1.Pos.Y < P2.Pos.Y then
+                      begin
+                        P1.Pos.Y := P2.Pos.Y - 40;
+                        P1.Vel.Y := -P1.Vel.Y * 0.5; // Bounce
+                        P1.Vel.X := P1.Vel.X * 0.9;
+                      end;
+                    end;
+          end;
+        }
+        else if (P2.Typ = ptWall) and (P1.Pos.Y > P2.Pos.Y - 40) and (P1.Pos.X > P2.Pos.X - 200) and (P1.Pos.X < P2.Pos.X + 200) then
+        begin
+          // Wall collision (Floor)
+          P1.Pos.Y := P2.Pos.Y - 40;
+          P1.Vel.Y := -P1.Vel.Y * 0.5; // Bounce
+          P1.Vel.X := P1.Vel.X * 0.9;
+        end;
+      end;
+    end;
+  end;
+
+  // Clean up dead parts
+  for I := FParts.Count - 1 downto 0 do
+    if FParts[I].Dead then FParts.Delete(I);
+end;
+
+procedure TSkiaIncredibleMachine.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF223322);
+  DrawParts(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaIncredibleMachine.DrawParts(const ACanvas: ISkCanvas);
+var
+  P: TPart;
+  Paint, Glow: ISkPaint;
+  PB: ISkPathBuilder;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for P in FParts do
+  begin
+    ACanvas.Save;
+    ACanvas.Translate(P.Pos.X, P.Pos.Y);
+    ACanvas.Rotate(P.Angle);
+    
+    case P.Typ of
+      ptBall: begin
+                // Bowling Ball
+                Paint.Color := $FF111111;
+                ACanvas.DrawCircle(TPointF.Zero, 15, Paint);
+                Paint.Color := $FF333333;
+                ACanvas.DrawCircle(PointF(-5, -5), 4, Paint); // Hole
+                ACanvas.DrawCircle(PointF(5, 5), 4, Paint); // Hole
+              end;
+      ptRamp: begin
+                Paint.Color := $FF8B4513;
+                ACanvas.DrawRect(TRectF.Create(-40, -5, 40, 5), Paint); // 80px wide
+                Paint.Color := $FFA0522D;
+                ACanvas.DrawCircle(TPointF.Zero, 4, Paint); // Pivot
+              end;
+      ptKicker: begin
+                  Paint.Color := $FF333333;
+                  ACanvas.DrawRect(TRectF.Create(-20, -5, 20, 5), Paint); // Base
+                  Paint.Color := $FFFF0000;
+                  ACanvas.DrawCircle(PointF(0, -10), 8, Paint); // Trigger Button
+                end;
+      ptRocket: begin
+                  Paint.Color := $FFCCCCCC;
+                  ACanvas.DrawRoundRect(TRectF.Create(-5, -20, 5, 10), 2, 2, Paint); // Body
+                  Paint.Color := $FFFF0000;
+                  ACanvas.DrawRect(TRectF.Create(-5, -25, 5, -20), Paint); // Nose
+                  Paint.Color := $FF0000FF;
+                  ACanvas.DrawRect(TRectF.Create(-10, 10, -5, 20), Paint); // Fin L
+                  ACanvas.DrawRect(TRectF.Create(5, 10, 10, 20), Paint); // Fin R
+                end;
+      ptGoal: begin
+                // Star
+                Paint.Color := $FFFFD700;
+                Glow := TSkPaint.Create(Paint);
+                Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 8.0);
+                ACanvas.DrawCircle(TPointF.Zero, 15, Glow);
+                ACanvas.DrawCircle(TPointF.Zero, 15, Paint);
+              end;
+      ptWall: begin
+                Paint.Color := $FF444444;
+                ACanvas.DrawRect(TRectF.Create(-Width, -10, Width, 10), Paint);
+              end;
+    end;
+    ACanvas.Restore;
+  end;
+end;
+
+procedure TSkiaIncredibleMachine.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    if FWinTimer > 0 then
+    begin
+      Paint.Color := $FF00FF00;
+      ACanvas.DrawSimpleText('LEVEL COMPLETE! Resetting...', 10, 30, Font, Paint);
+    end
+    else
+    begin
+      Paint.Color := TAlphaColors.White;
+      ACanvas.DrawSimpleText('Drag the brown Ramp to guide the Ball into the Rocket!', 10, 30, Font, Paint);
+    end;
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaIncredibleMachine.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  P: TPart;
+begin
+  if Button = TMouseButton.mbLeft then
+  begin
+    for P in FParts do
+    begin
+      if P.Typ = ptRamp then
+      begin
+        if (Abs(X - P.Pos.X) < 40) and (Abs(Y - P.Pos.Y) < 40) then
+        begin
+          FDragPart := P;
+          P.IsDragging := True;
+          P.DragOffset := PointF(X - P.Pos.X, Y - P.Pos.Y);
+          Break;
+        end;
+      end;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaIncredibleMachine.MouseMove(Shift: TShiftState; X, Y: Single);
+begin
+  if Assigned(FDragPart) then
+  begin
+    FDragPart.Pos := PointF(X, Y) - FDragPart.DragOffset;
+  end;
+  inherited;
+  Repaint;
+end;
+
+procedure TSkiaIncredibleMachine.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+begin
+  if Assigned(FDragPart) then
+  {
+    FDragPart.IsDragging := False;
+    FDragPart := nil;
+  }
+  inherited;
+end;
+
+procedure TSkiaIncredibleMachine.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  if KeyChar = 'R' then InitLevel;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaIncredibleMachine.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        fällt
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaIncredibleMachine.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        Len := NowTime - LastTime;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaIncredibleMachine.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  {
+    FThread.Terminate;
+    Sleep(50);
+  }
+end;
+
+end.

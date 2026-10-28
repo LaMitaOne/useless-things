@@ -1,0 +1,500 @@
+{*******************************************************************************
+  SkiaRoguelike (Turn-Based Procedural Prototype)
+********************************************************************************
+  A classic turn-based roguelike prototype. Features procedural room generation, 
+  turn-based movement (enemies only move when player moves), and grid combat.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaRoguelike;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  MAP_W = 40;
+  MAP_H = 25;
+  TILE = 24;
+
+type
+  TTileType = (ttWall, ttFloor, ttDoor);
+
+  TEnemy = class
+    X, Y: Integer;
+    HP: Integer;
+    Atk: Integer;
+    Symbol: string;
+    Color: TAlphaColor;
+  end;
+
+  TSkiaRoguelike = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMap: array[0..MAP_W-1, 0:: MAP_H-1] of TTileType;
+    FPlayerX, FPlayerY: Integer;
+    FPlayerHP: Integer;
+    FPlayerAtk: Integer;
+    FEnemies: TObjectList<TEnemy>;
+    FLevel: Integer;
+    FMessage: string;
+    
+    procedure GenerateLevel;
+    procedure CarveRoom(X1, Y1, X2, Y2: Integer);
+    procedure CarveTunnel(X1, Y1, X2, Y2: Integer);
+    function IsWall(X, Y: Integer): Boolean;
+    
+    procedure ProcessTurn;
+    procedure DoLogicUpdate;
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawMap(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+    procedure DrawEntities(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaRoguelike }
+
+constructor TSkiaRoguelike.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FEnemies := TObjectList<TEnemy>.Create(True);
+  FLevel := 1;
+  GenerateLevel;
+  StartThread;
+end;
+
+destructor TSkiaRoguelike.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FEnemies);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaRoguelike.GenerateLevel;
+var
+  I, RoomCount, RX, RY, RW, RH: Integer;
+  En: TEnemy;
+begin
+  FEnemies.Clear;
+  
+  // Fill with Walls
+  for var Y := 0 to MAP_H - 1 do
+    for var X := 0 to MAP_W - 1 do
+      FMap[X, Y] := ttWall;
+
+  // Generate 5-8 Rooms
+  RoomCount := Random(4) + 5;
+  var Rooms: array of TRect;
+  SetLength(Rooms, RoomCount);
+  
+  for I := 0 to RoomCount - 1 do
+  begin
+    RW := Random(6) + 4;
+    RH := Random(5) + 4;
+    RX := Random(MAP_W - RW - 2) + 1;
+    RY := Random(MAP_H - RH - 2) + 1;
+    Rooms[I] := Rect(RX, RY, RX + RW, RY + RH);
+    CarveRoom(RX, RY, RX + RW, RY + RH);
+  end;
+  
+  // Connect Rooms with Tunnels (L-Shaped)
+  for I := 0 to RoomCount - 2 do
+  begin
+    var C1 := Rooms[I].CenterPoint;
+    var C2 := Rooms[I+1].CenterPoint;
+    CarveTunnel(Trunc(C1.X), Trunc(C1.Y), Trunc(C2.X), Trunc(C2.Y));
+  end;
+
+  // Place Player in first room
+  FPlayerX := Rooms[0].CenterPoint.X;
+  FPlayerY := Rooms[0].CenterPoint.Y;
+  FPlayerHP := 20;
+  FPlayerAtk := 5;
+
+  // Place Enemies in subsequent rooms
+  for I := 1 to RoomCount - 1 do
+  begin
+    if Random(2) = 0 then Continue; // 50% chance for enemy
+    
+    En := TEnemy.Create;
+    En.X := Rooms[I].CenterPoint.X + Random(3) - 1;
+    En.Y := Rooms[I].CenterPoint.Y + Random(3) - 1;
+    En.HP := 5 + FLevel;
+    En.Atk := 2 + FLevel;
+    if Random(2) = 0 then
+    begin
+      En.Symbol := 'R'; // Rat
+      En.Color := $FFAAAAAA;
+    end
+    else
+    begin
+      En.Symbol := 'G'; // Goblin
+      En.Color := $FF00AA00;
+      En.HP := En.HP + 3;
+    end;
+    FEnemies.Add(En);
+  end;
+  
+  // Place Door (Exit) in last room
+  FMap[Rooms[RoomCount-1].CenterPoint.X, Rooms[RoomCount-1].CenterPoint.Y] := ttDoor;
+  
+  FMessage := 'Level ' + IntToStr(FLevel) + ': Explore the dungeon!';
+end;
+
+procedure TSkiaRoguelike.CarveRoom(X1, Y1, X2, Y2: Integer);
+var
+  X, Y: Integer;
+begin
+  for Y := Y1 to Y2 do
+    for X := X1 to X2 do
+      if (X >= 0) and (X < MAP_W) and (Y >= 0) and (Y < MAP_H) then
+        FMap[X, Y] := ttFloor;
+end;
+
+procedure TSkiaRoguelike.CarveTunnel(X1, Y1, X2, Y2: Integer);
+var
+  X, Y: Integer;
+begin
+  // Horizontal
+  if X1 < X2 then
+    for X := X1 to X2 do FMap[X, Y1] := ttFloor
+  else
+    for X := X2 to X1 do FMap[X, Y2] := ttFloor;
+    
+  // Vertical
+  if Y1 < Y2 then
+    for Y := Y1 to Y2 do FMap[X2, Y] := ttFloor
+  else
+    for Y := Y2 to Y1 do FMap[X1, Y] := ttFloor;
+end;
+
+function TSkiaRoguelike.IsWall(X, Y: Integer): Boolean;
+begin
+  if (X < 0) or (X >= MAP_W) or (Y < 0) or (Y >= MAP_H) then Exit(True);
+  Result := FMap[X, Y] = ttWall;
+end;
+
+procedure TSkiaRoguelike.ProcessTurn;
+var
+  Left, Right, Up, Down: Boolean;
+  NewX, NewY: Integer;
+  I: Integer;
+  En: TEnemy;
+  Attacked: Boolean;
+  DX, DY: Integer;
+begin
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    
+    // Consume Input
+    FKeys := [];
+  finally
+    FLock.Release;
+  end;
+
+  if (FPlayerHP <= 0) and ((Left or Right or Up or Down) or True) then
+  begin
+    if FPlayerHP <= 0 then
+    begin
+      FLevel := 1;
+      GenerateLevel;
+      Exit;
+    end;
+  end;
+
+  NewX := FPlayerX;
+  NewY := FPlayerY;
+  
+  if Left then Dec(NewX);
+  if Right then Inc(NewX);
+  if Up then Dec(NewY);
+  if Down then Inc(NewY);
+
+  // No move
+  if (NewX = FPlayerX) and (NewY = FPlayerY) then Exit;
+
+  // Check Wall
+  if IsWall(NewX, NewY) then Exit;
+
+  // Check Door
+  if FMap[NewX, NewY] = ttDoor then
+  begin
+    Inc(FLevel);
+    GenerateLevel;
+    Exit;
+  end;
+
+  // Check Enemy Attack
+  Attacked := False;
+  for I := 0 to FEnemies.Count - 1 do
+  begin
+    En := FEnemies[I];
+    if (En.X = NewX) and (En.Y = NewY) then
+    begin
+      Dec(En.HP, FPlayerAtk);
+      FMessage := 'You hit ' + En.Symbol + ' for ' + IntToStr(FPlayerAtk) + ' dmg!';
+      Attacked := True;
+      if En.HP <= 0 then
+      begin
+        FMessage := 'You killed the ' + En.Symbol + '!';
+        FEnemies.Delete(I);
+      end;
+      Break;
+    end;
+  end;
+
+  if not Attacked then
+  begin
+    FPlayerX := NewX;
+    FPlayerY := NewY;
+  end;
+
+  // Enemy Turn (Only if player actually moved or attacked)
+  for I := 0 to FEnemies.Count - 1 do
+  begin
+    En := FEnemies[I];
+    
+    // Simple AI: If player is adjacent (including diagonals), attack.
+    if Abs(En.X - FPlayerX) <= 1 and Abs(En.Y - FPlayerY) <= 1 then
+    begin
+      Dec(FPlayerHP, En.Atk);
+      FMessage := En.Symbol + ' hits you for ' + IntToStr(En.Atk) + ' dmg!';
+    end
+    else
+    begin
+      // Move 1 step towards player (Basic greedy pathfinding)
+      DX := Sign(FPlayerX - En.X);
+      DY := Sign(FPlayerY - En.Y);
+      
+      // Try horizontal first
+      if (DX <> 0) and not IsWall(En.X + DX, En.Y) then
+        En.X := En.X + DX
+      // Then vertical
+      else if (DY <> 0) and not IsWall(En.X, En.Y + DY) then
+        En.Y := En.Y + DY;
+    end;
+  end;
+
+  // Check Death
+  if FPlayerHP <= 0 then
+  begin
+    FMessage := 'YOU DIED! Press any key to restart.';
+  end;
+end;
+
+procedure TSkiaRoguelike.DoLogicUpdate;
+begin
+  // Turn-based: We only process if there are keys pressed!
+  if FKeys <> [] then
+    ProcessTurn;
+end;
+
+procedure TSkiaRoguelike.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  OffsetX, OffsetY: Single;
+begin
+  ACanvas.Clear($FF000000);
+  
+  // Center map
+  OffsetX := (Width - (MAP_W * TILE)) / 2;
+  OffsetY := 10;
+  
+  DrawMap(ACanvas, OffsetX, OffsetY);
+  DrawEntities(ACanvas, OffsetX, OffsetY);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaRoguelike.DrawMap(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+var
+  X, Y: Integer;
+  Rect: TRectF;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for Y := 0 to MAP_H - 1 do
+  begin
+    for X := 0 to MAP_W - 1 do
+    {
+      Rect := TRectF.Create(X * TILE + OffsetX, Y * TILE + OffsetY, (X+1) * TILE + OffsetX, (Y+1) * TILE + OffsetY);
+      case FMap[X, Y] of
+        ttWall: begin
+                  Paint.Color := $FF222222;
+                  ACanvas.DrawRect(Rect, Paint);
+                end;
+        ttFloor: begin
+                   Paint.Color := $FF111111;
+                   ACanvas.DrawRect(Rect, Paint);
+                 end;
+        ttDoor: begin
+                  Paint.Color := $FFAA0000;
+                  ACanvas.DrawRect(Rect, Paint);
+                end;
+      end;
+    end;
+  end;
+end;
+
+procedure TSkiaRoguelike.DrawEntities(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+var
+  En: TEnemy;
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  Font.Size := 18;
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Draw Player (@)
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawSimpleText('@', FPlayerX * TILE + OffsetX + 5, FPlayerY * TILE + OffsetY + 18, Font, Paint);
+  
+  // Draw Enemies
+  for En in FEnemies do
+  begin
+    Paint.Color := En.Color;
+    ACanvas.DrawSimpleText(En.Symbol, En.X * TILE + OffsetX + 5, En.Y * TILE + OffsetY + 18, Font, Paint);
+  end;
+  Font.Free;
+end;
+
+procedure TSkiaRoguelike.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    Paint.Color := TAlphaColors.Red;
+    ACanvas.DrawSimpleText('HP: ' + IntToStr(FPlayerHP), 10, 30, Font, Paint);
+    
+    Paint.Color := TAlphaColors.Yellow;
+    ACanvas.DrawSimpleText('Level: ' + IntToStr(FLevel), 10, 50, Font, Paint);
+    
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText(FMessage, 10, Height - 20, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaRoguelike.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vtkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaRoguelike.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  // Turn-based: We consume keys in ProcessTurn, so KeyUp just clears the set.
+  FLock.Acquire;
+  try
+    FKeys := [];
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaRoguelike.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaRoguelike.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoLogicUpdate;
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaRoguelike.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

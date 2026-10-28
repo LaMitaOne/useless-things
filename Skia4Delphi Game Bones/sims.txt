@@ -1,0 +1,468 @@
+{*******************************************************************************
+  SkiaSims (Need-Based AI Prototype)
+********************************************************************************
+  A top-down life simulation prototype inspired by The Sims.
+  Features need-based autonomous AI (hunger, energy, fun) and object interaction.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaSims;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TNeedType = (ntHunger, ntEnergy, ntFun);
+
+  TSim = class
+  public
+    Pos: TPointF;
+    Target: TPointF;
+    IsPlayer: Boolean;
+    Needs: array[TNeedType] of Single;
+    CurrentAction: string;
+    ActionTimer: Single;
+    Color: TAlphaColor;
+  end;
+
+  TSkiaSimsGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FPlayer: TSim;
+    FAI: TSim;
+    
+    // Objects (Bed, Fridge, Sofa)
+    FObjPos: array[0..2] of TPointF;
+    FObjName: array[0..2] of string;
+    
+    procedure InitGame;
+    procedure DoLogicUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure ProcessAI(S: TSim; DeltaSec: Double);
+    procedure DrawWalls(const ACanvas: ISkCanvas);
+    procedure DrawObjects(const ACanvas: ISkCanvas);
+    procedure DrawSims(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaSimsGame }
+
+constructor TSkiaSimsGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  InitGame;
+  StartThread;
+end;
+
+destructor TSkiaSimsGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FPlayer);
+  FreeAndNil(FAI);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaSimsGame.InitGame;
+begin
+  FPlayer := TSim.Create;
+  FPlayer.Pos := PointF(150, 150);
+  FPlayer.Target := FPlayer.Pos;
+  FPlayer.IsPlayer := True;
+  FPlayer.Color := $FF0066FF;
+  FPlayer.Needs[ntHunger] := 80;
+  FPlayer.Needs[ntEnergy] := 80;
+  FPlayer.Needs[ntFun] := 80;
+
+  FAI := TSim.Create;
+  FAI.Pos := PointF(400, 300);
+  FAI.Target := FAI.Pos;
+  FAI.IsPlayer := False;
+  FAI.Color := $FFFF0000;
+  FAI.Needs[ntHunger] := 80;
+  FAI.Needs[ntEnergy] := 80;
+  FAI.Needs[ntFun] := 80;
+
+  // Place Objects
+  FObjPos[0] := PointF(100, 400); FObjName[0] := 'Bed (Energy)';   // Bed
+  FObjPos[1] := PointF(600, 100); FObjName[1] := 'Fridge (Hunger)'; // Fridge
+  FObjPos[2] := PointF(600, 400); FObjName[2] := 'Sofa (Fun)';      // Sofa
+end;
+
+procedure TSkiaSimsGame.ProcessAI(S: TSim; DeltaSec: Double);
+var
+  LowestNeed: TNeedType;
+  TargetObj: Integer;
+  Dist: Single;
+begin
+  // 1. Needs decay over time
+  S.Needs[ntHunger] := Max(0, S.Needs[ntHunger] - 2 * DeltaSec);
+  S.Needs[ntEnergy] := Max(0, S.Needs[ntEnergy] - 1.5 * DeltaSec);
+  S.Needs[ntFun] := Max(0, S.Needs[ntFun] - 3 * DeltaSec);
+
+  // 2. If currently performing an action, don't make new decisions
+  if S.ActionTimer > 0 then
+  begin
+    S.ActionTimer := S.ActionTimer - DeltaSec;
+    Exit;
+  end;
+
+  // 3. Find the lowest need
+  LowestNeed := ntHunger;
+  if S.Needs[ntEnergy] < S.Needs[LowestNeed] then LowestNeed := ntEnergy;
+  if S.Needs[ntFun] < S.Needs[LowestNeed] then LowestNeed := ntFun;
+
+  // 4. If a need is critical (< 30), go to the corresponding object
+  if S.Needs[LowestNeed] < 30 then
+  begin
+    TargetObj := 0;
+    case LowestNeed of
+      ntEnergy: TargetObj := 0; // Bed
+      ntHunger: TargetObj := 1; // Fridge
+      ntFun: TargetObj := 2;    // Sofa
+    end;
+    
+    Dist := Hypot(S.Pos.X - FObjPos[TargetObj].X, S.Pos.Y - FObjPos[TargetObj].Y);
+    
+    // If close enough, use it
+    if Dist < 40 then
+    begin
+      S.ActionTimer := 3.0; // Takes 3 seconds to use
+      S.Needs[LowestNeed] := 100; // Refill need
+      S.CurrentAction := 'Using ' + FObjName[TargetObj];
+    end
+    else
+    begin
+      // Walk to object
+      S.Target := FObjPos[TargetObj];
+      S.CurrentAction := 'Going to ' + FObjName[TargetObj];
+    end;
+  end
+  else
+  begin
+    S.CurrentAction := 'Idle';
+    // Wander randomly if idle
+    if (S.Pos.X = S.Target.X) and (S.Pos.Y = S.Target.Y) then
+    begin
+      S.Target := PointF(Random(Width - 100) + 50, Random(Height - 100) + 50);
+    end;
+  end;
+end;
+
+procedure TSkiaSimsGame.DoLogicUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  Spd: Single;
+begin
+  if not FActive then Exit;
+
+  // --- PLAYER INPUT ---
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  Spd := 100 * DeltaSec;
+  if Left then FPlayer.Target.X := FPlayer.Pos.X - Spd;
+  if Right then FPlayer.Target.X := FPlayer.Pos.X + Spd;
+  if Up then FPlayer.Target.Y := FPlayer.Pos.Y - Spd;
+  if Down then FPlayer.Target.Y := FPlayer.Pos.Y + Spd;
+  
+  // Player Needs decay slower when controlled manually
+  FPlayer.Needs[ntHunger] := Max(0, FPlayer.Needs[ntHunger] - 1 * DeltaSec);
+  FPlayer.Needs[ntEnergy] := Max(0, FPlayer.Needs[ntEnergy] - 0.5 * DeltaSec);
+  FPlayer.Needs[ntFun] := Max(0, FPlayer.Needs[ntFun] - 1.5 * DeltaSec);
+  FPlayer.ActionTimer := 0; // Player can't be locked in action in this proto
+  FPlayer.CurrentAction := 'Player Controlled';
+
+  // --- AI LOGIC ---
+  ProcessAI(FAI, DeltaSec);
+
+  // --- MOVEMENT ---
+  // Player
+  if Hypot(FPlayer.Target.X - FPlayer.Pos.X, FPlayer.Target.Y - FPlayer.Pos.Y) > 2 then
+  begin
+    var DX := FPlayer.Target.X - FPlayer.Pos.X;
+    var DY := FPlayer.Target.Y - FPlayer.Pos.Y;
+    var Len := Hypot(DX, DY);
+    FPlayer.Pos.X := FPlayer.Pos.X + (DX / Len) * Spd;
+    FPlayer.Pos.Y := FPlayer.Pos.Y + (DY / Len) * Spd;
+  end;
+  
+  // AI
+  if FAI.ActionTimer <= 0 then
+  begin
+    if Hypot(FAI.Target.X - FAI.Pos.X, FAI.Target.Y - FAI.Pos.Y) > 2 then
+    begin
+      var DX := FAI.Target.X - FAI.Pos.X;
+      var DY := FAI.Target.Y - FAI.Pos.Y;
+      var Len := Hypot(DX, DY);
+      FAI.Pos.X := FAI.Pos.X + (DX / Len) * Spd * 0.8;
+      FAI.Pos.Y := FAI.Pos.Y + (DY / Len) * Spd * 0.8;
+    end;
+  end;
+end;
+
+procedure TSkiaSimsGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF2F2F2F);
+  DrawWalls(ACanvas);
+  DrawObjects(ACanvas);
+  DrawSims(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaSimsGame.DrawWalls(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF444444;
+  // Room borders
+  ACanvas.DrawRect(TRectF.Create(50, 50, Width - 50, Height - 50), Paint);
+  Paint.Color := $FF333333; // Floor
+  ACanvas.DrawRect(TRectF.Create(60, 60, Width - 60, Height - 60), Paint);
+end;
+
+procedure TSkiaSimsGame.DrawObjects(const ACanvas: ISkCanvas);
+var
+  I: Integer;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for I := 0 to 2 do
+  begin
+    case I of
+      0: Paint.Color := $FF0000CC; // Bed (Blue)
+      1: Paint.Color := $FFCCCCCC; // Fridge (White)
+      2: Paint.Color := $FF884400; // Sofa (Brown)
+    end;
+    ACanvas.DrawRect(TRectF.Create(FObjPos[I].X - 20, FObjPos[I].Y - 20, FObjPos[I].X + 20, FObjPos[I].Y + 20), Paint);
+  end;
+end;
+
+procedure TSkiaSimsGame.DrawSims(const ACanvas: ISkCanvas);
+var
+  S: TSim;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for S in [FPlayer, FAI] do
+  begin
+    // Shadow
+    Paint.Color := $FF000000;
+    Paint.Alpha := 80;
+    ACanvas.DrawOval(TRectF.Create(S.Pos.X - 10, S.Pos.Y + 5, S.Pos.X + 10, S.Pos.Y + 12), Paint);
+    Paint.Alpha := 255;
+    
+    // Body
+    Paint.Color := S.Color;
+    ACanvas.DrawCircle(S.Pos, 10, Paint);
+    
+    // Action Text
+    if S.ActionTimer > 0 then
+    begin
+      var Font := TSkFont.Create;
+      try
+        Paint.Color := $FFFFFFFF;
+        ACanvas.DrawSimpleText(S.CurrentAction, S.Pos.X - 30, S.Pos.Y - 20, Font, Paint);
+      finally
+        Font.Free;
+      end;
+    end;
+  end;
+end;
+
+procedure TSkiaSimsGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+  Y: Integer;
+  NeedName: string;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Player Bars
+    Paint.Color := $FF0066FF;
+    ACanvas.DrawSimpleText('PLAYER', 10, 20, Font, Paint);
+    Y := 35;
+    for var N := Low(TNeedType) to High(TNeedType) do
+    begin
+      case N of
+        ntHunger: NeedName := 'Hunger';
+        ntEnergy: NeedName := 'Energy';
+        ntFun: NeedName := 'Fun';
+      end;
+      Paint.Color := $FF000000;
+      ACanvas.DrawRect(TRectF.Create(10, Y, 110, Y + 10), Paint);
+      case N of
+        ntHunger: Paint.Color := $FFFF0000;
+        ntEnergy: Paint.Color := $FF00FF00;
+        ntFun: Paint.Color := $FF0000FF;
+      end;
+      ACanvas.DrawRect(TRectF.Create(11, Y + 1, 11 + FPlayer.Needs[N], Y + 9), Paint);
+      Paint.Color := $FFFFFFFF;
+      ACanvas.DrawSimpleText(NeedName, 120, Y + 9, Font, Paint);
+      Y := Y + 15;
+    end;
+
+    // AI Bars
+    Paint.Color := $FFFF0000;
+    ACanvas.DrawSimpleText('AI SIM', Width - 120, 20, Font, Paint);
+    Y := 35;
+    for var N := Low(TNeedType) to High(TNeedType) do
+    begin
+      Paint.Color := $FF000000;
+      ACanvas.DrawRect(TRectF.Create(Width - 110, Y, Width - 10, Y + 10), Paint);
+      case N of
+        ntHunger: Paint.Color := $FFFF0000;
+        ntEnergy: Paint.Color := $FF00FF00;
+        ntFun: Paint.Color := $FF0000FF;
+      end;
+      ACanvas.DrawRect(TRectF.Create(Width - 109, Y + 1, Width - 109 + FAI.Needs[N], Y + 9), Paint);
+      Y := Y + 15;
+    end;
+    
+    Paint.Color := $FFFFFFFF;
+    ACanvas.DrawSimpleText('WASD: Move Player | Watch AI fill needs automatically!', 10, Height - 10, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaSimsGame.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+begin
+  if Button = TMouseButton.mbLeft then
+    FPlayer.Target := PointF(X, Y); // Click to move
+  inherited;
+end;
+
+procedure TSkiaSimsGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSimsGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSimsGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaSimsGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoLogicUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end});
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaSimsGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

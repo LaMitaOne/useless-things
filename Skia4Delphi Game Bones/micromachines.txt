@@ -1,0 +1,305 @@
+{*******************************************************************************
+  SkiaMicroMachines (Top-Down Racer Prototype)
+********************************************************************************
+  A top-down racing prototype featuring free-grid car physics (acceleration, 
+  friction, steering), surface detection (track vs grass), and a dynamic 
+  follow-camera. Built entirely with Skia4Delphi.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaMicroMachines;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TSkiaMicroMachinesGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FCarX, FCarY: Single;
+    FCarAngle: Single; // Degrees (0 = Right, 90 = Down)
+    FCarSpeed: Single;
+    
+    FCameraX, FCameraY: Single;
+    FCameraAngle: Single;
+    
+    procedure InitRace;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaMicroMachinesGame }
+
+constructor TSkiaMicroMachinesGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  InitRace;
+  StartThread;
+end;
+
+destructor TSkiaMicroMachinesGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaMicroMachinesGame.InitRace;
+begin
+  FCarX := 200;
+  FCarY := 200;
+  FCarAngle := 0;
+  FCarSpeed := 0;
+  FCameraX := FCarX;
+  FCameraY := FCarY;
+  FCameraAngle := 0;
+end;
+
+procedure TSkiaMicroMachinesGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  Accel, Friction, TurnSpeed: Single;
+  Rad: Single;
+  VX, VY: Single;
+  IsOnTrack: Boolean;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // Define Track Boundaries (A simple rectangular track in world coords)
+  // Track goes from 0,0 to 2000,1500. Inner grass is 300,300 to 1700,1200.
+  IsOnTrack := True;
+  if (FCarX > 300) and (FCarX < 1700) and (FCarY > 300) and (FCarY < 1200) then
+    IsOnTrack := False; // On grass
+
+  // Physics Parameters
+  Accel := 350;
+  if not IsOnTrack then Accel := 100; // Slow on grass
+  
+  Friction := 2.0;
+  if not IsOnTrack then Friction := 5.0; // High friction on grass
+
+  // Update Speed
+  if Up then
+    FCarSpeed := Min(FCarSpeed + Accel * DeltaSec, 300) // Max Speed 300
+  else if Down then
+    FCarSpeed := Max(FCarSpeed - Accel * DeltaSec, -150) // Max Reverse 150
+  else
+    FCarSpeed := FCarSpeed - (FCarSpeed * Friction * DeltaSec); // Slow down naturally
+
+  // Steering (depends on speed and direction of movement)
+  if Abs(FCarSpeed) > 5 then
+  begin
+    TurnSpeed := 120 * (FCarSpeed / 300); // Turn faster at higher speeds, reverse steering when going backwards
+    if Left then FCarAngle := FCarAngle - TurnSpeed * DeltaSec;
+    if Right then FCarAngle := FCarAngle + TurnSpeed * DeltaSec;
+  end;
+
+  // Update Position
+  Rad := DegToRad(FCarAngle);
+  VX := Cos(Rad) * FCarSpeed * DeltaSec;
+  VY := Sin(Rad) * FCarSpeed * DeltaSec;
+  
+  FCarX := FCarX + VX;
+  FCarY := FCarY + VY;
+
+  // Keep car inside world bounds
+  FCarX := EnsureRange(FCarX, 0, 2000);
+  FCarY := EnsureRange(FCarY, 0, 1500);
+
+  // Camera smoothly follows car and rotates slightly towards driving direction
+  FCameraX := FCameraX + (FCarX - FCameraX) * 5 * DeltaSec;
+  FCameraY := FCameraY + (FCarY - FCameraY) * 5 * DeltaSec;
+  
+  // Dynamic Camera Angle (Lerp towards car angle for a bit of drift feeling)
+  FCameraAngle := FCameraAngle + (FCarAngle - FCameraAngle) * 2 * DeltaSec;
+end;
+
+procedure TSkiaMicroMachinesGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  Paint: ISkPaint;
+  ScreenCX, ScreenCY: Single;
+begin
+  ACanvas.Clear($FF1a3a1a); // Dark Grass Background
+
+  ScreenCX := Width / 2;
+  ScreenCY := Height / 2;
+
+  ACanvas.Save;
+  // 1. Move to screen center
+  ACanvas.Translate(ScreenCX, ScreenCY);
+  // 2. Rotate world by negative camera angle (so camera is upright, world rotates)
+  ACanvas.Rotate(-FCameraAngle);
+  // 3. Move world so camera is at 0,0
+  ACanvas.Translate(-FCameraX, -FCameraY);
+
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+
+  // Draw World Track Boundaries (2000x1500)
+  Paint.Color := $FF3CB371; // Grass
+  ACanvas.DrawRect(TRectF.Create(0, 0, 2000, 1500), Paint);
+  
+  Paint.Color := $FF444444; // Track Asphalt
+  ACanvas.DrawRect(TRectF.Create(0, 0, 2000, 1500), Paint);
+  ACanvas.DrawRect(TRectF.Create(300, 300, 1700, 1200), Paint); // Inner Grass
+
+  // Draw Start Line
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawRect(TRectF.Create(150, 100, 250, 150), Paint);
+
+  // Draw Car
+  ACanvas.Save;
+  ACanvas.Translate(FCarX, FCarY);
+  ACanvas.Rotate(FCarAngle);
+  
+  Paint.Color := $FFFF0000;
+  ACanvas.DrawRoundRect(TRectF.Create(-15, -10, 15, 10), 3, 3, Paint);
+  
+  Paint.Color := $FF0000FF;
+  ACanvas.DrawRoundRect(TRectF.Create(5, -10, 15, 10), 2, 2, Paint); // Front Bumper
+  
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawCircle(PointF(-5, -5), 2, Paint); // Headlight L
+  ACanvas.DrawCircle(PointF(-5, 5), 2, Paint);  // Headlight R
+  
+  ACanvas.Restore;
+
+  ACanvas.Restore; // Restore Camera Transform
+
+  // Draw UI (Screen Space)
+  var Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD/Arrows: Drive | Stay on the dark asphalt!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaMicroMachinesGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaMicroMachinesGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaMicroMachinesGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaMicroMachinesGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaMicroMachinesGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

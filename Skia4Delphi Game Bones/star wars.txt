@@ -1,0 +1,454 @@
+{*******************************************************************************
+  SkiaStarWarsSpeeder (Dual-Mode Engine Prototype)
+********************************************************************************
+  An engine prototype inspired by the Star Wars Gameboy game.
+  Seamlessly switches between Top-Down Speeder physics and Side-Scrolling 
+  Platformer physics in a single game loop.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaStarWarsSpeeder;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 1200;
+
+type
+  TGameMode = (gmSpeeder, gmPlatformer);
+
+  TObstacle = record
+    X, Y: Single;
+    W, H: Single;
+    IsRock: Boolean; // True = Rock (Speeder), False = Platform (Platformer)
+  end;
+
+  TSkiaStarWarsGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMode: TGameMode;
+    FScrollX: Single;
+    
+    // Speeder State
+    FSpeederX, FSpeederY: Single;
+    FSpeederAngle: Single;
+    FSpeederSpeed: Single;
+    FSpeederTimer: Single;
+    
+    // Platformer State
+    FPlayerX, FPlayerY: Single;
+    FPlayerVelX, FPlayerVelY: Single;
+    FOnGround: Boolean;
+    
+    FObstacles: TList<TObstacle>;
+    
+    procedure InitSpeederLevel;
+    procedure InitPlatformerLevel;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawSpeederMode(const ACanvas: ISkCanvas);
+    procedure DrawPlatformerMode(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaStarWarsGame }
+
+constructor TSkiaStarWarsGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FObstacles := TList<TObstacle>.Create;
+  InitSpeederLevel;
+  StartThread;
+end;
+
+destructor TSkiaStarWarsGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FObstacles);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaStarWarsGame.InitSpeederLevel;
+var
+  I: Integer;
+  Obs: TObstacle;
+begin
+  FMode := gmSpeeder;
+  FScrollX := 0;
+  FSpeederX := 200;
+  FSpeederY := 300;
+  FSpeederAngle := 0;
+  FSpeederSpeed := 200;
+  FSpeederTimer := 0;
+  FObstacles.Clear;
+  
+  // Generate Rocks
+  for I := 0 to 15 do
+  begin
+    Obs.X := Random(3000) + 500;
+    Obs.Y := Random(400) + 100;
+    Obs.W := 40;
+    Obs.H := 40;
+    Obs.IsRock := True;
+    FObstacles.Add(Obs);
+  end;
+end;
+
+procedure TSkiaStarWarsGame.InitPlatformerLevel;
+var
+  I: Integer;
+  Obs: TObstacle;
+begin
+  FMode := gmPlatformer;
+  FScrollX := 0;
+  FPlayerX := 100;
+  FPlayerY := 200;
+  FPlayerVelX := 0;
+  FPlayerVelY := 0;
+  FOnGround := False;
+  FObstacles.Clear;
+  
+  // Ground
+  Obs.X := 0; Obs.Y := 400; Obs.W := 3000; Obs.H := 200; Obs.IsRock := False; FObstacles.Add(Obs);
+  
+  // Platforms
+  for I := 0 to 10 do
+  begin
+    Obs.X := I * 250 + 200;
+    Obs.Y := Random(100) + 250;
+    Obs.W := 100;
+    Obs.H := 20;
+    Obs.IsRock := False;
+    FObstacles.Add(Obs);
+  end;
+end;
+
+procedure TSkiaStarWarsGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  I: Integer;
+  Obs: TObstacle;
+  NextX, NextY: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  case FMode of
+    gmSpeeder: begin
+                 // --- SPEEDER PHYSICS ---
+                 if Up then FSpeederSpeed := Min(FSpeederSpeed + 200 * DeltaSec, 400)
+                 else if Down then FSpeederSpeed := Max(FSpeederSpeed - 400 * DeltaSec, 100)
+                 else FSpeederSpeed := Max(FSpeederSpeed - 50 * DeltaSec, 150);
+                 
+                 if Left then FSpeederAngle := Max(FSpeederAngle - 150 * DeltaSec, -30);
+                 if Right then FSpeederAngle := Min(FSpeederAngle + 150 * DeltaSec, 30);
+                 
+                 FSpeederY := FSpeederY + FSpeederAngle * DeltaSec;
+                 FSpeederY := EnsureRange(FSpeederY, 50, Height - 100);
+                 
+                 FScrollX := FScrollX + FSpeederSpeed * DeltaSec;
+                 
+                 // Check Cave Entry (Bottom of screen)
+                 if FSpeederY > Height - 120 then
+                 begin
+                   FSpeederTimer := FSpeederTimer + DeltaSec;
+                   if FSpeederTimer > 1.0 then InitPlatformerLevel;
+                 end
+                 else
+                   FSpeederTimer := 0;
+               end;
+    gmPlatformer: begin
+                    // --- PLATFORMER PHYSICS ---
+                    if Left then FPlayerVelX := Max(FPlayerVelX - 1000 * DeltaSec, -250);
+                    if Right then FPlayerVelX := Min(FPlayerVelX + 1000 * DeltaSec, 250);
+                    if not Left and not Right then FPlayerVelX := FPlayerVelX * 0.8;
+                    
+                    if Up and FOnGround then
+                    begin
+                      FPlayerVelY := -500;
+                      FOnGround := False;
+                    end;
+                    
+                    FPlayerVelY := FPlayerVelY + GRAVITY * DeltaSec;
+                    
+                    NextX := FPlayerX + FPlayerVelX * DeltaSec;
+                    NextY := FPlayerY + FPlayerVelY * DeltaSec;
+                    
+                    FOnGround := False;
+                    
+                    // Collision
+                    for I := 0 to FObstacles.Count - 1 do
+                    begin
+                      Obs := FObstacles[I];
+                      // Simple AABB
+                      if (NextX + 15 > Obs.X) and (NextX - 15 < Obs.X + Obs.W) and
+                         (NextY + 20 > Obs.Y) and (NextY - 20 < Obs.Y + Obs.H) then
+                      begin
+                        // Hit ground from above
+                        if (FPlayerVelY > 0) and (FPlayerY + 20 <= Obs.Y + 10) then
+                        begin
+                          FPlayerY := Obs.Y - 20;
+                          FPlayerVelY := 0;
+                          FOnGround := True;
+                        end;
+                      end;
+                    end;
+                    
+                    FPlayerX := NextX;
+                    FPlayerY := NextY;
+                    FScrollX := FPlayerX - 200;
+                  end;
+  end;
+end;
+
+procedure TSkiaStarWarsGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  case FMode of
+    gmSpeeder: DrawSpeederMode(ACanvas);
+    gmPlatformer: DrawPlatformerMode(ACanvas);
+  end;
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaStarWarsGame.DrawSpeederMode(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  I: Integer;
+  Obs: TObstacle;
+  ScreenX: Single;
+begin
+  ACanvas.Clear($FFD2691E); // Desert BG
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Draw Scrolling Sand Stripes
+  Paint.Color := $FFCD853F;
+  for I := 0 to 20 do
+  begin
+    ScreenX := I * 100 - (FScrollX * 0.5) mod 100;
+    ACanvas.DrawRect(TRectF.Create(ScreenX, 0, ScreenX + 50, Height), Paint);
+  end;
+  
+  // Draw Cave at bottom
+  Paint.Color := $FF111111;
+  ACanvas.DrawRect(TRectF.Create(0, Height - 80, Width, Height), Paint);
+  
+  // Draw Obstacles (Rocks)
+  for I := 0 to FObstacles.Count - 1 do
+  begin
+    Obs := FObstacles[I];
+    ScreenX := Obs.X - FScrollX;
+    if (ScreenX > -50) and (ScreenX < Width + 50) then
+    begin
+      Paint.Color := $FF8B4513;
+      ACanvas.DrawCircle(PointF(ScreenX, Obs.Y), 20, Paint);
+    end;
+  end;
+  
+  // Draw Speeder
+  ACanvas.Save;
+  ACanvas.Translate(FSpeederX, FSpeederY);
+  ACanvas.Rotate(FSpeederAngle * 0.5);
+  
+  Paint.Color := $FFCCCCCC;
+  ACanvas.DrawRoundRect(TRectF.Create(-30, -10, 30, 10), 4, 4, Paint); // Body
+  Paint.Color := $FFDDDDDD;
+  ACanvas.DrawRoundRect(TRectF.Create(-10, -15, 10, -5), 2, 2, Paint); // Cockpit
+  
+  ACanvas.Restore;
+end;
+
+procedure TSkiaStarWarsGame.DrawPlatformerMode(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  I: Integer;
+  Obs: TObstacle;
+  ScreenX: Single;
+begin
+  ACanvas.Clear($FF222222); // Cave BG
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Draw Obstacles (Platforms)
+  for I := 0 to FObstacles.Count - 1 do
+  begin
+    Obs := FObstacles[I];
+    ScreenX := Obs.X - FScrollX;
+    if (ScreenX > -200) and (ScreenX < Width + 200) then
+    begin
+      Paint.Color := $FF8B4513;
+      ACanvas.DrawRect(TRectF.Create(ScreenX, Obs.Y, ScreenX + Obs.W, Obs.Y + Obs.H), Paint);
+      Paint.Color := $FF228B22;
+      ACanvas.DrawRect(TRectF.Create(ScreenX, Obs.Y, ScreenX + Obs.W, Obs.Y + 5), Paint); // Grass top
+    end;
+  end;
+  
+  // Draw Player (Luke)
+  ACanvas.Save;
+  ACanvas.Translate(FPlayerX - FScrollX, FPlayerY);
+  
+  Paint.Color := $FF0000FF;
+  ACanvas.DrawRoundRect(TRectF.Create(-10, -20, 10, 10), 3, 3, Paint); // Body
+  Paint.Color := $FFFFD700;
+  ACanvas.DrawCircle(PointF(0, -25), 6, Paint); // Head
+  
+  ACanvas.Restore;
+end;
+
+procedure TSkiaStarWarsGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+  Txt: string;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    
+    if FMode = gmSpeeder then
+    begin
+      Txt := 'SPEEDER MODE: W=Gas, A/D=Steer | Fly to the dark Cave at the bottom!';
+      Paint.Color := TAlphaColors.White;
+    end
+    else
+    begin
+      Txt := 'PLATFORMER MODE: A/D=Walk, W=Jump';
+      Paint.Color := TAlphaColors.Yellow;
+    end;
+    
+    ACanvas.DrawSimpleText(Txt, 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaStarWarsGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarWarsGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarWarsGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaStarWarsGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaStarWarsGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

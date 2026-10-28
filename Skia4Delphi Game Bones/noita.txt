@@ -1,0 +1,497 @@
+{*******************************************************************************
+  SkiaNoita (Pixel Physics Falling Sand Prototype)
+********************************************************************************
+  A cellular automata prototype inspired by Noita. Simulates materials (Sand, 
+  Water, Fire, Stone) on a per-pixel basis directly manipulating a bitmap buffer.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaNoita;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia, FMX.Graphics;
+
+const
+  W = 200;
+  H = 150;
+
+type
+  TMatType = (mtEmpty, mtSand, mtWater, mtStone, mtFire, mtOil, mtSmoke);
+
+  TSkiaNoita = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FGrid: array[0..W-1, 0..H-1] of TMatType;
+    FBitmap: TBitmap; // We draw directly to this bitmap
+    FBrushSize: Integer;
+    FCurrentMat: TMatType;
+    FIsDrawing: Boolean;
+    FLastMouseX, FLastMouseY: Single;
+    
+    procedure InitGrid;
+    procedure DoPhysicsUpdate;
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawBrush(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+    
+    procedure PaintCircle(X, Y: Integer);
+    procedure UpdateBitmap;
+    
+    function GetMatColor(Mat: TMatType): TAlphaColor;
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Single); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaNoita }
+
+constructor TSkiaNoita.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FBitmap := TBitmap.Create(W, H);
+  InitGrid;
+  FBrushSize := 6;
+  FCurrentMat := mtSand;
+  StartThread;
+end;
+
+destructor TSkiaNoita.Destroy;
+begin
+  StopThread;
+  FBitmap.Free;
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaNoita.InitGrid;
+var
+  X, Y: Integer;
+begin
+  for Y := 0 to H - 1 do
+    for X := 0 to W - 1 do
+      FGrid[X, Y] := mtEmpty;
+      
+  // Draw Floor
+  for X := 0 to W - 1 do
+    FGrid[X, H - 1] := mtStone;
+end;
+
+function TSkiaNoita.GetMatColor(Mat: TMatType): TAlphaColor;
+begin
+  case Mat of
+    mtEmpty: Result := $FF000000;
+    mtSand: Result := $FFDDDD00;
+    mtWater: Result := $FF0066FF;
+    mtStone: Result := $FF888888;
+    mtFire: Result := $FFFF5500;
+    mtOil: Result := $FF442200;
+    mtSmoke: Result := $FF333333;
+  else
+    Result := $FF000000;
+  end;
+end;
+
+procedure TSkiaNoita.PaintCircle(X, Y: Integer);
+var
+  DX, DY: Integer;
+begin
+  for DY := -FBrushSize to FBrushSize do
+  begin
+    for DX := -FBrushSize to FBrushSize do
+    begin
+      if (DX*DX + DY*DY) <= (FBrushSize*FBrushSize) then
+      begin
+        if (X+DX >= 0) and (X+DX < W) and (Y+DY >= 0) and (Y+DY < H) then
+        begin
+          // Don't overwrite stone unless erasing
+          if (FCurrentMat = mtEmpty) or (FGrid[X+DX, Y+DY] <> mtStone) then
+            FGrid[X+DX, Y+DY] := FCurrentMat;
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TSkiaNoita.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  GridX, GridY: Integer;
+begin
+  FIsDrawing := True;
+  FLastMouseX := X;
+  FLastMouseY := Y;
+  
+  GridX := Trunc((X / Width) * W);
+  GridY := Trunc((Y / Height) * H);
+  
+  FLock.Acquire;
+  try
+    if Button = TMouseButton.mbLeft then FCurrentMat := mtSand
+    else if Button = TMouseButton.mbRight then FCurrentMat := mtWater
+    else if Button = TMouseButton.mbMiddle then FCurrentMat := mtFire
+    else FCurrentMat := mtSand; // Fallback
+    PaintCircle(GridX, GridY);
+  finally
+    FLock.Release;
+  end;
+  inherited;
+end;
+
+procedure TSkiaNoita.MouseMove(Shift: TShiftState; X, Y: Single);
+var
+  Steps, I: Integer;
+  LerpX, LerpY: Single;
+begin
+  if FIsDrawing then
+  begin
+    FLock.Acquire;
+    try
+      // Lerp between last mouse pos and current for smooth drawing
+      Steps := Max(1, Trunc(Hypot(X - FLastMouseX, Y - FLastMouseY) / 2));
+      for I := 0 to Steps do
+      begin
+        LerpX := FLastMouseX + (X - FLastMouseX) * (I / Steps);
+        LerpY := FLastMouseY + (Y - FLastMouseY) * (I / Steps);
+        PaintCircle(Trunc((LerpX / Width) * W), Trunc((LerpY / Height) * H));
+      end;
+      FLastMouseX := X;
+      FLastMouseY := Y;
+    finally
+      FLock.Release;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaNoita.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+begin
+  FIsDrawing := False;
+  inherited;
+end;
+
+procedure TSkiaNoita.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    if KeyChar = '1' then FCurrentMat := mtSand;
+    if KeyChar = '2' then FCurrentMat := mtWater;
+    if KeyChar = '3' then FCurrentMat := mtFire;
+    if KeyChar = '4' then FCurrentMat := mtStone;
+    if KeyChar = '5' then FCurrentMat := mtOil;
+    if KeyChar = '6' then FCurrentMat := mtSmoke;
+    if KeyChar = 'E' then FCurrentMat := mtEmpty;
+    if KeyChar = 'C' then InitGrid;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaNoita.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  inherited;
+end;
+
+procedure TSkiaNoita.UpdateBitmap;
+var
+  X, Y: Integer;
+  MapData: TBitmapData;
+begin
+  if FBitmap.Map(TMapAccess.Write, MapData) then
+  try
+    for Y := 0 to H - 1 do
+    begin
+      for X := 0 to W - 1 do
+      begin
+        PAlphaColorArray(MapData.Data)^[Y * W + X] := GetMatColor(FGrid[X, Y]);
+      end;
+    end;
+  finally
+    FBitmap.Unmap(MapData);
+  end;
+end;
+
+procedure TSkiaNoita.DoPhysicsUpdate;
+var
+  X, Y: Integer;
+  NewGrid: array[0..W-1, 0:: H-1] of TMatType;
+  Tmp: TMatType;
+  Dir: Integer;
+  DidFall: Boolean;
+begin
+  // Copy current grid to new grid
+  for Y := 0 to H - 1 do
+    for X := 0 to W - 1 do
+      NewGrid[X, Y] := FGrid[X, Y];
+
+  // Process bottom-up for sand/water to fall into empty space below
+  for Y := H - 2 downto 0 do
+  begin
+    // Alternate left-right scan direction for natural flow
+    if (Y mod 2) = 0 then
+    begin
+      for X := 0 to W - 1 do
+      begin
+        Tmp := NewGrid[X, Y];
+        if (Tmp = mtSand) or (Tmp = mtWater) or (Tmp = mtOil) then
+        begin
+          // Down
+          if NewGrid[X, Y+1] = mtEmpty then
+          begin
+            NewGrid[X, Y+1] := Tmp;
+            NewGrid[X, Y] := mtEmpty;
+            Continue;
+          end
+          // Down-Left / Down-Right (Diagonal)
+          else
+          begin
+            Dir := Random(2);
+            if Dir = 0 then Dir := -1 else Dir := 1;
+            
+            if (X+Dir >= 0) and (X+Dir < W) and (NewGrid[X+Dir, Y+1] = mtEmpty) then
+            begin
+              NewGrid[X+Dir, Y+1] := Tmp;
+              NewGrid[X, Y] := mtEmpty;
+            end
+            else if (X-Dir >= 0) and (X-Dir < W) and (NewGrid[X-Dir, Y+1] = mtEmpty) then
+            begin
+              NewGrid[X-Dir, Y+1] := Tmp;
+              NewGrid[X, Y] := mtEmpty;
+            end;
+          end;
+        end
+        else if Tmp = mtWater then
+        begin
+          // Water flows sideways
+          Dir := Random(2);
+          if Dir = 0 then Dir := -1 else Dir := 1;
+          if (X+Dir >= 0) and (X+Dir < W) and (NewGrid[X+Dir, Y] = mtEmpty) then
+          begin
+            NewGrid[X+Dir, Y] := Tmp;
+            NewGrid[X, Y] := mtEmpty;
+          end;
+        end;
+      end;
+    end
+    else
+    begin
+      for X := W - 1 downto 0 do
+      begin
+        Tmp := NewGrid[X, Y];
+        // (Same logic as above, just right-to-left)
+        if (Tmp = mtSand) or (Tmp = mtWater) or (Tmp = dtOil) then
+        begin
+          if NewGrid[X, Y+1] = mtEmpty then
+          begin
+            NewGrid[X, Y+1] := Tmp;
+            NewGrid[X, Y] := mtEmpty;
+            Continue;
+          end
+          else
+          begin
+            Dir := Random(2);
+            if Dir = 0 then Dir := -1 else Dir := 1;
+            if (X+Dir >= 0) and (X+Dir < W) and (NewGrid[X+Dir, Y+1] = mtEmpty) then
+            begin
+              NewGrid[X+Dir, Y+1] := Tmp;
+              NewGrid[X, Y] := mtEmpty;
+            end
+            else if (X-Dir >= 0) and (X-Dir < W) and (NewGrid[X-Dir, Y+1] = mtEmpty) then
+            begin
+              NewGrid[X-Dir, Y+1] := Tmp;
+              NewGrid[X, Y] := mtEmpty;
+            end;
+          end;
+        end
+        else if Tmp = mtWater then
+        begin
+          Dir := Random(2);
+          if Dir = 0 then Dir := -1 else Dir := 1;
+          if (X+Dir >= 0) und (X+Dir < W) and (NewGrid[X+Dir, Y] = mtEmpty) then
+          begin
+            NewGrid[X+Dir, Y] := Tmp;
+            NewGrid[X, Y] := mtEmpty;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  // Fire & Smoke Logic
+  for Y := 0 to H - 1 do
+  begin
+    for X := 0 to W - 1 do
+    begin
+      if NewGrid[X, Y] = mtFire then
+      begin
+        // Fire dies out and turns to smoke
+        if Random(5) = 0 then
+          NewGrid[X, Y] := mtSmoke
+        else
+        begin
+          // Fire spreads to Oil and Water
+          if (Y > 0) and (NewGrid[X, Y-1] = mtOil) then NewGrid[X, Y-1] := mtFire;
+          if (Y < H-1) and (NewGrid[X, Y+1] = mtOil) then NewGrid[X, Y+1] := mtFire;
+          if (X > 0) and (NewGrid[X-1, Y] = mtOil) then NewGrid[X-1, Y] := mtFire;
+          if (X < W-1) and (NewGrid[X+1, Y] = mtOil) then NewGrid[X+1, Y] := mtFire;
+          
+          // Water extinguishes fire
+          if (Y > 0) and (NewGrid[X, Y-1] = mtWater) then NewGrid[X, Y] := mtSmoke;
+          if (Y < H-1) and (NewGrid[X, Y+1] = mtWater) then NewGrid[X, Y] := mtSmoke;
+          if (X > 0) and (NewGrid[X-1, Y] = mtWater) then NewGrid[X, Y] := mtSmoke;
+          if (X < W-1) and (NewGrid[X+1, Y] = mtWater) then NewGrid[X, Y] := mtSmoke;
+        end;
+      end
+      else if NewGrid[X, Y] = mtSmoke then
+      begin
+        // Smoke rises
+        if (Y > 0) and (NewGrid[X, Y-1] = mtEmpty) then
+        begin
+          NewGrid[X, Y-1] := mtSmoke;
+          NewGrid[X, Y] := mtEmpty;
+        end
+        else if Random(10) = 0 then
+          NewGrid[X, Y] := mtEmpty; // Smoke dissipates
+      end;
+    end;
+  end;
+
+  // Copy back
+  for Y := 0 to H - 1 do
+    for X := 0 to W - 1 do
+      FGrid[X, Y] := NewGrid[X, Y];
+      
+  UpdateBitmap;
+end;
+
+procedure TSkiaNoita.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  SrcRect, DstRect: TRectF;
+begin
+  // Draw the pixel grid stretched to the screen
+  SrcRect := TRectF.Create(0, 0, W, H);
+  DstRect := TRectF.Create(0, 0, Width, Height);
+  ACanvas.DrawBitmap(FBitmap, SrcRect, DstRect, 1.0, False);
+  
+  DrawBrush(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaNoita.DrawBrush(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  MousePos: TPointF;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFFFFFF;
+  Paint.StrokeWidth := 2;
+  
+  // Scale brush size to screen size
+  MousePos := ScreenToClient(Mouse.CursorPos);
+  ACanvas.DrawCircle(MousePos, FBrushSize * (Width / W), Paint);
+end;
+
+procedure TSkiaNoita.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+  Txt: string;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := $FFFFFFFF;
+    
+    case FCurrentMat of
+      mtSand: Txt := '1:Sand';
+      mtWater: Txt := '2:Water';
+      mtFire: Txt := '3:Fire';
+      mtStone: Txt := '4:Stone';
+      mtOil: Txt := '5:Oil';
+      mtSmoke: Txt := '6:Smoke';
+      mtEmpty: Txt := 'E:Eraser';
+    end;
+    
+    ACanvas.DrawSimpleText('Material: ' + Txt, 10, 20, Font, Paint);
+    ACanvas.DrawSimpleText('Left: Sand | Right: Water | Mid: Fire | Keys 1-6/E/C', 10, 40, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaNoita.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaNoita.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      while not TThread.CheckTerminated do
+      begin
+        if FActive then
+        begin
+          DoPhysicsUpdate;
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaNoita.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

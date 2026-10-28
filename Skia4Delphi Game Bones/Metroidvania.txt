@@ -1,0 +1,465 @@
+{*******************************************************************************
+  SkiaMetroidvania (Exploration Platformer Prototype)
+********************************************************************************
+  A prototype inspired by Metroid/Hollow Knight. Features tile-based level 
+  design, ability unlocking (Dash), and world-state switches (toggleable blocks).
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaMetroidvania;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  TILE = 32;
+  MAP_W = 40;
+  MAP_H = 15;
+
+type
+  TTileType = (ttEmpty, ttWall, ttDoorClosed, ttDoorOpen, ttItem, ttSwitch);
+
+  TSkiaMetroidvania = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMap: array[0..MAP_W-1, 0:: MAP_H-1] of TTileType;
+    FPlayerX, FPlayerY: Single;
+    FPlayerVelX, FPlayerVelY: Single;
+    FOnGround: Boolean;
+    FFacingRight: Boolean;
+    
+    FCameraX: Single;
+    FHasDash: Boolean;
+    FDashTimer: Single;
+    FDoorOpen: Boolean;
+    
+    procedure InitLevel;
+    function CanWalk(X, Y: Single): Boolean;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawTile(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+    procedure DrawPlayer(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaMetroidvania }
+
+constructor TSkiaMetroidvania.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaMetroidvania.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaMetroidvania.InitLevel;
+var
+  X, Y: Integer;
+begin
+  FPlayerX := 64;
+  FPlayerY := 64;
+  FPlayerVelX := 0;
+  FPlayerVelY := 0;
+  FOnGround := False;
+  FFacingRight := True;
+  FCameraX := 0;
+  FHasDash := False;
+  FDashTimer := 0;
+  FDoorOpen := False;
+
+  // Clear Map
+  for Y := 0 to MAP_H - 1 do
+    for X := 0 to MAP_W - 1 do
+      FMap[X, Y] := ttEmpty;
+
+  // Border Walls
+  for X := 0 to MAP_W - 1 do
+  begin
+    FMap[X, 0] := ttWall;
+    FMap[X, MAP_H - 1] := ttWall;
+  end;
+  for Y := 0 to MAP_H - 1 do
+  begin
+    FMap[0, Y] := ttWall;
+    FMap[MAP_W - 1, Y] := ttWall;
+  end;
+
+  // Labyrinth Layout
+  for X := 2 to 10 do FMap[X, 10] := ttWall; // Floor 1
+  for Y := 10 to 13 do FMap[5, Y] := ttWall; // Wall 1
+  
+  for X := 12 to 20 do FMap[X, 8] := ttWall; // Floor 2
+  for Y := 8 to 13 do FMap[15, Y] := ttWall; // Wall 2
+  
+  for X := 22 to 30 do FMap[X, 10] := ttWall; // Floor 3
+  for Y := 10 to 13 do FMap[25, Y] := ttWall; // Wall 3
+  
+  for X := 32 to 38 do FMap[X, 12] := ttWall; // Floor 4
+
+  // The Door (Blocks the secret area)
+  for Y := 10 to 13 do FMap[8, Y] := ttDoorClosed;
+
+  // The Switch (Opens the door)
+  FMap[35, 11] := ttSwitch;
+
+  // The Dash Item
+  FMap[25, 9] := ttItem;
+end;
+
+function TSkiaMetroidvania.CanWalk(X, Y: Single): Boolean;
+var
+  GX, GY: Integer;
+begin
+  Result := False;
+  GX := Trunc(X / TILE);
+  GY := Trunc(Y / TILE);
+  if (GX < 0) or (GX >= MAP_W) or (GY < 0) or (GY >= MAP_H) then Exit;
+  
+  case FMap[GX, GY] of
+    ttEmpty, ttItem, ttSwitch, ttDoorOpen: Result := True;
+    ttWall, ttDoorClosed: Result := False;
+  end;
+end;
+
+procedure TSkiaMetroidvania.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Dash: Boolean;
+  Accel, MaxSpeed, Friction: Single;
+  NextX, NextY: Single;
+  GX, GY: Integer;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Dash := (Byte(vkShift) in FKeys) or (Byte(Ord('L')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // Consume Dash Input
+  if Dash and FHasDash and (FDashTimer <= 0) then
+  begin
+    FDashTimer := 0.2; // Dash lasts 200ms
+    FLock.Acquire;
+    try Exclude(FKeys, vkShift); Exclude(FKeys, Byte(Ord('L'))); finally FLock.Release; end;
+  end;
+
+  // Physics
+  Accel := 1000;
+  MaxSpeed := 150;
+  if FDashTimer > 0 then MaxSpeed := 500;
+
+  if Left then
+  begin
+    FPlayerVelX := Max(FPlayerVelX - Accel * DeltaSec, -MaxSpeed);
+    FFacingRight := False;
+  end
+  else if Right then
+  begin
+    FPlayerVelX := Min(FPlayerVelX + Accel * DeltaSec, MaxSpeed);
+    FFacingRight := True;
+  end
+  else
+  begin
+    FPlayerVelX := FPlayerVelX * 0.85; // Friction
+    if Abs(FPlayerVelX) < 5 then FPlayerVelX := 0;
+  end;
+
+  if FDashTimer > 0 then
+    FDashTimer := FDashTimer - DeltaSec;
+
+  // Jump
+  if Up and FOnGround then
+  begin
+    FPlayerVelY := -400;
+    FOnGround := False;
+  end;
+
+  // Gravity
+  FPlayerVelY := FPlayerVelY + 1000 * DeltaSec;
+  if FPlayerVelY > 800 then FPlayerVelY := 800; // Terminal Velocity
+
+  // Horizontal Collision
+  NextX := FPlayerX + FPlayerVelX * DeltaSec;
+  if CanWalk(NextX - 8, FPlayerY - 14) and CanWalk(NextX + 8, FPlayerY - 14) and
+     CanWalk(NextX - 8, FPlayerY + 14) and CanWalk(NextX + 8, FPlayerY + 14) then
+    FPlayerX := NextX
+  else
+  begin
+    FPlayerVelX := 0;
+    if FDashTimer > 0 then FDashTimer := 0; // Stop dash on wall hit
+  end;
+
+  // Vertical Collision
+  NextY := FPlayerY + FPlayerVelY * DeltaSec;
+  FOnGround := False;
+  if CanWalk(FPlayerX - 8, NextY - 14) and CanWalk(FPlayerX + 8, NextY - 14) and
+     CanWalk(FPlayerX - 8, NextY + 14) and CanWalk(FPlayerX + 8, NextY + 14) then
+    FPlayerY := NextY
+  else
+  begin
+    if FPlayerVelY > 0 then FOnGround := True; // Landed on ground
+    FPlayerVelY := 0;
+  end;
+
+  // Interactions (Pickup & Switch)
+  GX := Trunc(FPlayerX / TILE);
+  GY := Trunc(FPlayerY / TILE);
+  
+  if (GX >= 0) and (GX < MAP_W) and (GY >= 0) and (GY < MAP_H) then
+  begin
+    if FMap[GX, GY] = ttItem then
+    begin
+      FHasDash := True;
+      FMap[GX, GY] := ttEmpty; // Remove item
+    end
+    else if FMap[GX, GY] = ttSwitch then
+    begin
+      if not FDoorOpen then
+      begin
+        FDoorOpen := True;
+        // Open the door
+        for Y := 0 to MAP_H - 1 do
+          if FMap[8, Y] = ttDoorClosed then FMap[8, Y] := ttDoorOpen;
+      end;
+    end;
+  end;
+
+  // Camera Follow
+  FCameraX := FCameraX + (FPlayerX - Width / 2 - FCameraX) * 5 * DeltaSec;
+  FCameraX := EnsureRange(FCameraX, 0, MAP_W * TILE - Width);
+end;
+
+procedure TSkiaMetroidvania.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  StartX, EndX, X, Y: Integer;
+  OffsetX, OffsetY: Single;
+begin
+  ACanvas.Clear($FF111122);
+  
+  OffsetX := -FCameraX;
+  OffsetY := 0;
+  
+  StartX := Max(0, Trunc(FCameraX / TILE));
+  EndX := Min(MAP_W, StartX + Trunc(Width / TILE) + 2);
+
+  for Y := 0 to MAP_H - 1 do
+    for X := StartX to EndX do
+      DrawTile(ACanvas, X, Y, OffsetX, OffsetY);
+
+  DrawPlayer(ACanvas, OffsetX, OffsetY);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaMetroidvania.DrawTile(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+var
+  Rect: TRectF;
+  Paint, Glow: ISkPaint;
+begin
+  Rect := TRectF.Create(Col * TILE + OffsetX, Row * TILE + OffsetY, (Col+1) * TILE + OffsetX, (Row+1) * TILE + OffsetY);
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+
+  case FMap[Col, Row] of
+    ttWall: begin
+              Paint.Color := $FF333355;
+              ACanvas.DrawRect(Rect, Paint);
+              Paint.Color := $FF222244;
+              Paint.Style := TSkPaintStyle.Stroke;
+              Paint.StrokeWidth := 2;
+              ACanvas.DrawRect(Rect, Paint);
+              Paint.Style := TSkPaintStyle.Fill;
+            end;
+    ttDoorClosed: begin
+                    Paint.Color := $FFAA0000;
+                    ACanvas.DrawRect(Rect, Paint);
+                    Paint.Color := $FF550000;
+                    ACanvas.DrawRect(TRectF.Create(Rect.Left, Rect.Top, Rect.Right, Rect.Top + 4), Paint);
+                  end;
+    ttDoorOpen: begin
+                  Paint.Color := $FF00AA00;
+                  ACanvas.DrawRect(TRectF.Create(Rect.Left, Rect.Top, Rect.Right, Rect.Top + 4), Paint);
+                  ACanvas.DrawRect(TRectF.Create(Rect.Left, Rect.Bottom - 4, Rect.Right, Rect.Bottom), Paint);
+                end;
+    ttItem: begin
+              Glow := TSkPaint.Create(Paint);
+              Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 8.0);
+              Glow.Color := $FF00FFFF;
+              ACanvas.DrawCircle(Rect.CenterPoint, 10, Glow);
+              Paint.Color := $FF00FFFF;
+              ACanvas.DrawCircle(Rect.CenterPoint, 5, Paint);
+            end;
+    ttSwitch: begin
+                Paint.Color := $FFAAAA00;
+                ACanvas.DrawCircle(Rect.CenterPoint, 10, Paint);
+              end;
+  end;
+end;
+
+procedure TSkiaMetroidvania.DrawPlayer(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+var
+  Paint, Glow: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Dash Trail Effect
+  if FDashTimer > 0 then
+  begin
+    Glow := TSkPaint.Create(Paint);
+    Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 8.0);
+    Glow.Color := $FF00FFFF;
+    Glow.Alpha := 150;
+    ACanvas.DrawRect(TRectF.Create(FPlayerX - 8 + OffsetX, FPlayerY - 14 + OffsetY, FPlayerX + 8 + OffsetX, FPlayerY + 14 + OffsetY), Glow);
+  end;
+  
+  // Body
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawRect(TRectF.Create(FPlayerX - 8 + OffsetX, FPlayerY - 14 + OffsetY, FPlayerX + 8 + OffsetX, FPlayerY + 14 + OffsetY), Paint);
+  
+  // Eye
+  Paint.Color := $FF0000FF;
+  if FFacingRight then
+    ACanvas.DrawCircle(PointF(FPlayerX + 4 + OffsetX, FPlayerY - 8 + OffsetY), 2, Paint)
+  else
+    ACanvas.DrawCircle(PointF(FPlayerX - 4 + OffsetX, FPlayerY - 8 + OffsetY), 2, Paint);
+end;
+
+procedure TSkiaMetroidvania.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Press Shift/L to Dash! | Find Switch to open Door!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaMetroidvania.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkShift, Byte(Ord('L')): Include(FKeys, vkShift);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaMetroidvania.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkShift, Byte(Ord('L')): Exclude(FKeys, vkShift);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaMetroidvania.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaMetroidvania.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaMetroidvania.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

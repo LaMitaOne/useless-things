@@ -1,0 +1,475 @@
+{*******************************************************************************
+  SkiaSimAnt (Emergent Swarm AI Prototype)
+********************************************************************************
+  A prototype inspired by SimAnt. Features pheromone trail mechanics and 
+  emergent swarm intelligence (ants follow trails to find food automatically).
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaSimAnt;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRID_W = 80;
+  GRID_H = 60;
+  TILE = 10;
+
+type
+  TAnt = class
+    Pos: TPointF;
+    Angle: Single;
+    HasFood: Boolean;
+    IsPlayer: Boolean;
+    IsEnemy: Boolean;
+    Dead: Boolean;
+  end;
+
+  TSkiaSimAnt = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FPlayer: TAnt;
+    FAnts: TObjectList<TAnt>;
+    FPheromones: array[0..GRID_W-1, 0:: GRID_H-1] of Single;
+    FFoodX, FFoodY: Single;
+    FBaseX, FBaseY: Single;
+    
+    procedure InitGame;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawGrid(const ACanvas: ISkCanvas);
+    procedure DrawAnts(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaSimAnt }
+
+constructor TSkiaSimAnt.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FAnts := TObjectList<TAnt>.Create(True);
+  InitGame;
+  StartThread;
+end;
+
+destructor TSkiaSimAnt.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FAnts);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaSimAnt.InitGame;
+var
+  I: Integer;
+  A: TAnt;
+begin
+  FAnts.Clear;
+  for var Y := 0 to GRID_H - 1 do
+    for var X := 0 to GRID_W - 1 do
+      FPheromones[X, Y] := 0;
+      
+  FBaseX := 100;
+  FBaseY := 100;
+  FFoodX := Width - 100;
+  FFoodY := Height - 100;
+  
+  FPlayer := TAnt.Create;
+  FPlayer.Pos := PointF(FBaseX, FBaseY);
+  FPlayer.Angle := 0;
+  FPlayer.HasFood := False;
+  FPlayer.IsPlayer := True;
+  FPlayer.IsEnemy := False;
+  FAnts.Add(FPlayer);
+  
+  // Spawn Friendly Ants
+  for I := 0 to 9 do
+  begin
+    A := TAnt.Create;
+    A.Pos := PointF(FBaseX + Random(40)-20, FBaseY + Random(40)-20);
+    A.Angle := Random(360);
+    A.HasFood := False;
+    A.IsPlayer := False;
+    A.IsEnemy := False;
+    FAnts.Add(A);
+  end;
+  
+  // Spawn Enemy Ants
+  for I := 0 to 2 do
+  begin
+    A := TAnt.Create;
+    A.Pos := PointF(FFoodX, FFoodY);
+    A.Angle := Random(360);
+    A.HasFood := False;
+    A.IsPlayer := False;
+    A.IsEnemy := True;
+    FAnts.Add(A);
+  end;
+end;
+
+procedure TSkiaSimAnt.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  I, J: Integer;
+  A, A2: TAnt;
+  TargetX, TargetY: Single;
+  DX, DY, Dist: Single;
+  BestX, BestY, BestVal: Single;
+  GX, GY, SX, SY: Single;
+  Rad: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // Evaporate Pheromones
+  for var Y := 0 to GRID_H - 1 do
+    for var X := 0 to GRID_W - 1 do
+      FPheromones[X, Y] := Max(0, FPheromones[X, Y] - 0.5 * DeltaSec);
+
+  // --- PLAYER LOGIC ---
+  if Left then FPlayer.Angle := FPlayer.Angle - 150 * DeltaSec;
+  if Right then FPlayer.Angle := FPlayer.Angle + 150 * DeltaSec;
+  if Up then
+  begin
+    Rad := DegToRad(FPlayer.Angle);
+    FPlayer.Pos.X := FPlayer.Pos.X + Cos(Rad) * 60 * DeltaSec;
+    FPlayer.Pos.Y := FPlayer.Pos.Y + Sin(Rad) * 60 * DeltaSec;
+  end;
+  if Down then
+  begin
+    Rad := DegToRad(FPlayer.Angle);
+    FPlayer.Pos.X := FPlayer.Pos.X - Cos(Rad) * 30 * DeltaSec;
+    FPlayer.Pos.Y := FPlayer.Pos.Y - Sin(Rad) * 30 * DeltaSec;
+  end;
+  
+  // Player collect/drop food
+  if Hypot(FPlayer.Pos.X - FFoodX, FPlayer.Pos.Y - FFoodY) < 15 then FPlayer.HasFood := True;
+  if Hypot(FPlayer.Pos.X - FBaseX, FPlayer.Pos.Y - FBaseY) < 15 then FPlayer.HasFood := False;
+  
+  // Player drops pheromone if carrying food
+  if FPlayer.HasFood then
+  begin
+    GX := Trunc(FPlayer.Pos.X / TILE);
+    GY := Trunc(FPlayer.Pos.Y / TILE);
+    if (GX >= 0) and (GX < GRID_W) and (GY >= 0) and (GY < GRID_H) then
+      FPheromones[GX, GY] := 10; // Drop trail
+  end;
+
+  // --- ANT AI (EMERGENT) ---
+  for I := 0 to FAnts.Count - 1 do
+  begin
+    A := FAnts[I];
+    if A.IsPlayer or A.Dead then Continue;
+    
+    if A.HasFood then
+    begin
+      // Return to base
+      TargetX := FBaseX; TargetY := FBaseY;
+      if Hypot(A.Pos.X - FBaseX, A.Pos.Y - FBaseY) < 15 then A.HasFood := False;
+    end
+    else
+    begin
+      // Find best pheromone nearby
+      BestVal := 0;
+      BestX := A.Pos.X; BestY := A.Pos.Y;
+      
+      // Sample 3x3 grid around ant
+      GX := Trunc(A.Pos.X / TILE);
+      GY := Trunc(A.Pos.Y / TILE);
+      
+      for SX := -2 to 2 do
+      begin
+        for SY := -2 to 2 do
+        {
+          if (GX+SX >= 0) and (GX+SX < GRID_W) and (GY+SY >= 0) and (GY+SY < GRID_H) then
+          begin
+            if FPheromones[GX+SX, GY+SY] > BestVal then
+            begin
+              BestVal := FPheromones[GX+SX, GY+SY];
+              BestX := (GX+SX) * TILE + TILE/2;
+              BestY := (GY+SY) * TILE + TILE/2;
+            end;
+          end;
+        }
+      end;
+      
+      // If found trail, follow it. Else wander.
+      if BestVal > 0 then
+      begin
+        TargetX := BestX; TargetY := BestY;
+      end
+      else
+      begin
+        // Wander
+        TargetX := A.Pos.X + Cos(DegToRad(A.Angle)) * 10;
+        TargetY := A.Pos.Y + Sin(DegToRad(A.Angle)) * 10;
+      end;
+      
+      // Found food?
+      if Hypot(A.Pos.X - FFoodX, A.Pos.Y - FFoodY) < 15 then A.HasFood := True;
+    end;
+    
+    // Turn towards target
+    DX := TargetX - A.Pos.X;
+    DY := TargetY - A.Pos.Y;
+    Dist := Hypot(DX, DY);
+    if Dist > 0 then
+    begin
+      A.Angle := RadToDeg(ArcTan2(DY, DX)) + Random(10)-5; // Add some randomness
+    end;
+    
+    // Move
+    Rad := DegToRad(A.Angle);
+    A.Pos.X := A.Pos.X + Cos(Rad) * 30 * DeltaSec;
+    A.Pos.Y := A.Pos.Y + Sin(Rad) * 30 * DeltaSec;
+    
+    // Clamp to screen
+    A.Pos.X := EnsureRange(A.Pos.X, 10, Width - 10);
+    A.Pos.Y := EnsureRange(A.Pos.Y, 10, Height - 10);
+  end;
+  
+  // --- COMBAT ---
+  for I := 0 to FAnts.Count - 1 do
+  begin
+    A := FAnts[I];
+    if A.Dead then Continue;
+    for J := I + 1 to FAnts.Count - 1 do
+    begin
+      A2 := FAnts[J];
+      if A2.Dead then Continue;
+      if (A.IsEnemy <> A2.IsEnemy) and (Hypot(A.Pos.X - A2.Pos.X, A.Pos.Y - A2.Pos.Y) < 10) then
+      begin
+        // Fight! 50% chance to kill
+        if Random(2) = 0 then A.Dead := True else A2.Dead := True;
+      end;
+    end;
+  end;
+  
+  // Cleanup dead
+  for I := FAnts.Count - 1 downto 0 do
+    if FAnts[I].Dead then FAnts.Delete(I);
+end;
+
+procedure TSkiaSimAnt.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF3B2A1E); // Dirt Brown
+  DrawGrid(ACanvas);
+  DrawAnts(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaSimAnt.DrawGrid(const ACanvas: ISkCanvas);
+var
+  X, Y: Integer;
+  Rect: TRectF;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for Y := 0 to GRID_H - 1 do
+    for X := 0 to GRID_W - 1 do
+      if FPheromones[X, Y] > 0.1 then
+      begin
+        Rect := TRectF.Create(X * TILE, Y * TILE, (X+1) * TILE, (Y+1) * TILE);
+        // Blue trail, alpha based on strength
+        Paint.Color := $FF0000FF;
+        Paint.Alpha := Trunc(FPheromones[X, Y] * 25);
+        ACanvas.DrawRect(Rect, Paint);
+      end;
+      
+  Paint.Alpha := 255;
+  // Base (Anthill)
+  Paint.Color := $FF444444;
+  ACanvas.DrawCircle(PointF(FBaseX, FBaseY), 15, Paint);
+  
+  // Food
+  Paint.Color := $FF00FF00;
+  ACanvas.DrawCircle(PointF(FFoodX, FFoodY), 10, Paint);
+end;
+
+procedure TSkiaSimAnt.DrawAnts(const ACanvas: ISkCanvas);
+var
+  A: TAnt;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for A in FAnts do
+  begin
+    if A.Dead then Continue;
+    ACanvas.Save;
+    ACanvas.Translate(A.Pos.X, A.Pos.Y);
+    ACanvas.Rotate(A.Angle);
+    
+    // Color: Player=Black, Enemy=Red, Carrying=Yellow
+    if A.IsPlayer then Paint.Color := $FF111111
+    else if A.IsEnemy then Paint.Color := $FFFF0000
+    else if A.HasFood then Paint.Color := $FFFFFF00
+    else Paint.Color := $FF222222;
+    
+    // Body (3 segments)
+    ACanvas.DrawCircle(TPointF.Zero, 3, Paint);
+    ACanvas.DrawCircle(PointF(-4, 0), 2, Paint);
+    ACanvas.DrawCircle(PointF(4, 0), 2, Paint);
+    
+    // Head
+    ACanvas.DrawCircle(PointF(6, 0), 2, Paint);
+    
+    ACanvas.Restore;
+  end;
+end;
+
+procedure TSkiaSimAnt.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD: Move (Up=Forward) | Collect Food to drop Blue Pheromone Trail', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaSimAnt.DropPheromone(X, Y: Single);
+var
+  GX, GY: Integer;
+begin
+  GX := Trunc(X / TILE);
+  GGY := Trunc(Y / TILE);
+  if (GX >= 0) and (GX < GRID_W) and (GY >= 0) and (GY < GRID_H) then
+    FPheromones[GX, GY] := 10;
+end;
+
+procedure TSkiaSimAnt.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Bee(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSimAnt.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSimAnt.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaSimAnt.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end});
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaSimAnt.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

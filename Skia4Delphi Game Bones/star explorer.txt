@@ -1,0 +1,480 @@
+{*******************************************************************************
+  SkiaStarExplorer (Dual-Mode Space/Platform Engine)
+********************************************************************************
+  An engine prototype seamlessly switching between Open-Space flight physics 
+  (thrust/inertia) and Side-Scrolling Platformer physics (gravity/jumping).
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaStarExplorer;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 1200;
+
+type
+  TGameMode = (gmSpace, gmPlatformer);
+
+  TPlanet = record
+    Pos: TPointF;
+    Radius: Single;
+    Color: TAlphaColor;
+  end;
+
+  TSkiaStarExplorer = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMode: TGameMode;
+    
+    // Space State
+    FShipX, FShipY: Single;
+    FShipVelX, FShipVelY: Single;
+    FShipAngle: Single;
+    FPlanets: TList<TPlanet>;
+    
+    // Platformer State
+    FPlayerX, FPlayerY: Single;
+    FPlayerVelX, FPlayerVelY: Single;
+    FOnGround: Boolean;
+    FPlatforms: TList<TRectF>;
+    
+    FCameraX, FCameraY: Single;
+    FMessage: string;
+    FMessageTimer: Single;
+    
+    procedure InitSpace;
+    procedure InitPlatformer(PlanetColor: TAlphaColor);
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawSpaceMode(const ACanvas: ISkCanvas);
+    procedure DrawPlatformerMode(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaStarExplorer }
+
+constructor TSkiaStarExplorer.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FPlanets := TList<TPlanet>.Create;
+  FPlatforms := TList<TRectF>.Create;
+  InitSpace;
+  StartThread;
+end;
+
+destructor TSkiaStarExplorer.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FPlanets);
+  FreeAndNil(FPlatforms);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaStarExplorer.InitSpace;
+var
+  I: Integer;
+  P: TPlanet;
+begin
+  FMode := gmSpace;
+  FShipX := 500;
+  FShipY := 500;
+  FShipVelX := 0;
+  FShipVelY := 0;
+  FShipAngle := -90; // Pointing Up
+  FPlanets.Clear;
+  
+  // Generate random Planets
+  for I := 0 to 4 do
+  begin
+    P.Pos := PointF(Random(2000) + 200, Random(2000) + 200);
+    P.Radius := Random(40) + 40;
+    if I mod 2 = 0 then P.Color := $FF4169E1 // Blue
+    else P.Color := $FFCD5C5C; // Red
+    FPlanets.Add(P);
+  end;
+  
+  FMessage := 'SPACE MODE: W=Thrust, A/D=Rotate | Fly into a Planet';
+  FMessageTimer := 5.0;
+end;
+
+procedure TSkiaStarExplorer.InitPlatformer(PlanetColor: TAlphaColor);
+var
+  I: Integer;
+  R: TRectF;
+begin
+  FMode := gmPlatformer;
+  FPlayerX := 100;
+  FPlayerY := 300;
+  FPlayerVelX := 0;
+  FPlayerVelY := 0;
+  FOnGround := False;
+  FPlatforms.Clear;
+  
+  // Ground
+  FPlatforms.Add(TRectF.Create(0, 400, 3000, 600));
+  
+  // Random Platforms
+  for I := 0 to 10 do
+  begin
+    R := TRectF.Create(I * 250 + 200, Random(150) + 200, I * 250 + 300, Random(150) + 220);
+    FPlatforms.Add(R);
+  end;
+  
+  FCameraX := 0;
+  FMessage := 'PLANET MODE: A/D=Walk, W=Jump | Reach the Green Portal to leave';
+  FMessageTimer := 5.0;
+end;
+
+procedure TSkiaStarExplorer.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up: Boolean;
+  I: Integer;
+  Rad, AccelX, AccelY: Single;
+  P: TPlanet;
+  R: TRectF;
+  NextX, NextY: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys) or (Byte(vkSpace) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  if FMessageTimer > 0 then FMessageTimer := FMessageTimer - DeltaSec;
+
+  case FMode of
+    gmSpace: begin
+               // --- SPACE PHYSICS ---
+               if Left then FShipAngle := FShipAngle - 150 * DeltaSec;
+               if Right then FShipAngle := FShipAngle + 150 * DeltaSec;
+               
+               if Up then
+               begin
+                 Rad := DegToRad(FShipAngle);
+                 // Thrust adds to velocity in facing direction
+                 FShipVelX := FShipVelX + Cos(Rad) * 200 * DeltaSec;
+                 FShipVelY := FShipVelY + Sin(Rad) * 200 * DeltaSec;
+               end;
+               
+               // Inertia (Space has no friction, but slight drag for playability)
+               FShipVelX := FShipVelX * 0.995;
+               FShipVelY := FShipVelY * 0.995;
+               
+               FShipX := FShipX + FShipVelX * DeltaSec;
+               FShipY := FShipY + FShipVelY * DeltaSec;
+               
+               // Check Planet Collision
+               for I := 0 to FPlanets.Count - 1 do
+               begin
+                 P := FPlanets[I];
+                 if Hypot(FShipX - P.Pos.X, FShipY - P.Pos.Y) < P.Radius + 15 then
+                 begin
+                   InitPlatformer(P.Color);
+                   Exit;
+                 end;
+               end;
+               
+               // Camera follows ship
+               FCameraX := FCameraX + (FShipX - Width/2 - FCameraX) * 5 * DeltaSec;
+               FCameraY := FCameraY + (FShipY - Height/2 - FCameraY) * 5 * DeltaSec;
+             end;
+    gmPlatformer: begin
+                    // --- PLATFORMER PHYSICS ---
+                    if Left then FPlayerVelX := Max(FPlayerVelX - 1000 * DeltaSec, -250);
+                    if Right then FPlayerVelX := Min(FPlayerVelX + 1000 * DeltaSec, 250);
+                    if not Left and not Right then FPlayerVelX := FPlayerVelX * 0.8;
+                    
+                    if Up and FOnGround then
+                    begin
+                      FPlayerVelY := -500;
+                      FOnGround := False;
+                    end;
+                    
+                    FPlayerVelY := FPlayerVelY + GRAVITY * DeltaSec;
+                    
+                    NextX := FPlayerX + FPlayerVelX * DeltaSec;
+                    NextY := FPlayerY + FPlayerVelY * DeltaSec;
+                    
+                    FOnGround := False;
+                    
+                    for I := 0 to FPlatforms.Count - 1 do
+                    begin
+                      R := FPlatforms[I];
+                      // Simple AABB
+                      if (NextX + 15 > R.Left) and (NextX - 15 < R.Right) and
+                         (NextY + 20 > R.Top) and (NextY - 20 < R.Bottom) then
+                      begin
+                        // Landed on top
+                        if (FPlayerVelY > 0) and (FPlayerY + 20 <= R.Top + 10) then
+                        begin
+                          FPlayerY := R.Top - 20;
+                          FPlayerVelY := 0;
+                          FOnGround := True;
+                        end;
+                      end;
+                    end;
+                    
+                    FPlayerX := NextX;
+                    FPlayerY := NextY;
+                    FCameraX := FCameraX + (FPlayerX - 200 - FCameraX) * 5 * DeltaSec;
+                    
+                    // Reached Portal (End of level)
+                    if FPlayerX > 2500 then
+                      InitSpace;
+                  end;
+  end;
+end;
+
+procedure TSkiaStarExplorer.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  case FMode of
+    gmSpace: DrawSpaceMode(ACanvas);
+    gmPlatformer: DrawPlatformerMode(ACanvas);
+  end;
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaStarExplorer.DrawSpaceMode(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  I: Integer;
+  P: TPlanet;
+begin
+  ACanvas.Clear($FF050510); // Deep Space Black
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Stars (Parallax background)
+  Paint.Color := $FFFFFFFF;
+  for I := 0 to 100 do
+  begin
+    var SX: Single := (I * 137 - FCameraX * 0.1) mod Width;
+    var SY: Single := (I * 271 - FCameraY * 0.1) mod Height;
+    if SX < 0 then SX := SX + Width;
+    if SY < 0 then SY := SY + Height;
+    ACanvas.DrawCircle(PointF(SX, SY), 1, Paint);
+  end;
+  
+  ACanvas.Save;
+  ACanvas.Translate(-FCameraX, -FCameraY);
+  
+  // Planets
+  for I := 0 to FPlanets.Count - 1 do
+  begin
+    P := FPlanets[I];
+    Paint.Color := P.Color;
+    ACanvas.DrawCircle(P.Pos, P.Radius, Paint);
+  end;
+  
+  // Ship
+  ACanvas.Save;
+  ACanvas.Translate(FShipX, FShipY);
+  ACanvas.Rotate(FShipAngle + 90); // Adjust sprite orientation
+  
+  Paint.Color := $FFCCCCCC;
+  ACanvas.DrawRoundRect(TRectF.Create(-10, -15, 10, 15), 3, 3, Paint); // Body
+  Paint.Color := $FF00FFFF;
+  ACanvas.DrawCircle(PointF(0, -5), 4, Paint); // Cockpit
+  
+  // Engine Flame
+  if (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys) or (Byte(vkSpace) in FKeys) then
+  begin
+    Paint.Color := $FFFF8800;
+    Paint.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 3.0);
+    ACanvas.DrawCircle(PointF(0, 20), 5, Paint);
+    Paint.MaskFilter := nil;
+  end;
+  
+  ACanvas.Restore;
+  ACanvas.Restore;
+end;
+
+procedure TSkiaStarExplorer.DrawPlatformerMode(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  I: Integer;
+  R: TRectF;
+  ScreenX: Single;
+begin
+  ACanvas.Clear($FF1a1a2e); // Cave/Sky BG
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Draw Platforms
+  for I := 0 to FPlatforms.Count - 1 do
+  begin
+    R := FPlatforms[I];
+    ScreenX := R.Left - FCameraX;
+    if (ScreenX > -300) and (ScreenX < Width + 300) then
+    begin
+      Paint.Color := $FF8B4513;
+      ACanvas.DrawRect(TRectF.Create(ScreenX, R.Top, ScreenX + R.Width, R.Bottom), Paint);
+      Paint.Color := $FF228B22;
+      ACanvas.DrawRect(TRectF.Create(ScreenX, R.Top, ScreenX + R.Width, R.Top + 5), Paint); // Grass top
+    end;
+  end;
+  
+  // Draw Portal (Goal)
+  Paint.Color := $FF00FF00;
+  Paint.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 10.0);
+  ACanvas.DrawCircle(PointF(2550 - FCameraX, 360), 20, Paint);
+  Paint.MaskFilter := nil;
+  
+  // Draw Player (Astronaut)
+  ACanvas.Save;
+  ACanvas.Translate(FPlayerX - FCameraX, FPlayerY);
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawRoundRect(TRectF.Create(-10, -20, 10, 10), 3, 3, Paint); // Body
+  Paint.Color := $FF111111;
+  ACanvas.DrawCircle(PointF(0, -25), 6, Paint); // Helmet Visor
+  ACanvas.Restore;
+end;
+
+procedure TSkiaStarExplorer.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    
+    if FMessageTimer > 0 then
+    begin
+      Paint.Color := $AA000000;
+      ACanvas.DrawRect(TRectF.Create(0, Height-60, Width, Height), Paint);
+      Paint.Color := $FFFFFFFF;
+      ACanvas.DrawSimpleText(FMessage, 20, Height-25, Font, Paint);
+    end;
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaStarExplorer.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkSpace: Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarExplorer.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkSpace: Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarExplorer.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaStarExplorer.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaStarExplorer.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

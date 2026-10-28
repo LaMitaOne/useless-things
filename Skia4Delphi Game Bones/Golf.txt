@@ -1,0 +1,421 @@
+{*******************************************************************************
+  SkiaGolf (Ballistic Physics Prototype)
+********************************************************************************
+  A 2D golf prototype inspired by NES Golf. Features ballistic projectile physics, 
+  adjustable angle/power, surface friction (fairway vs green), and hole detection.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaGolf;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 800;
+
+type
+  TSkiaGolf = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FBallX, FBallY: Single;
+    FVelX, FVelY: Single;
+    FAngle: Single;    // Degrees
+    FPower: Single;    // 0 to 100
+    FIsMoving: Boolean;
+    FStrokes: Integer;
+    FHoleX: Single;
+    
+    procedure InitHole;
+    function GetGroundY(X: Single): Single;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawTerrain(const ACanvas: ISkCanvas);
+    procedure DrawBall(const ACanvas: ISkCanvas);
+    procedure DrawAiming(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaGolf }
+
+constructor TSkiaGolf.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  InitHole;
+  StartThread;
+end;
+
+destructor TSkiaGolf.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaGolf.InitHole;
+begin
+  FBallX := 100;
+  FBallY := 400; // Will fall to ground on first frame
+  FVelX := 0;
+  FVelY := 0;
+  FAngle := 45;
+  FPower := 50;
+  FIsMoving := False;
+  FStrokes := 0;
+  FHoleX := Width - 150;
+end;
+
+function TSkiaGolf.GetGroundY(X: Single): Single;
+begin
+  // Wavy terrain. Green is flat at the end.
+  if X > FHoleX - 100 then
+    Result := 450
+  else
+    Result := 450 + Sin(X / 150) * 30;
+end;
+
+procedure TSkiaGolf.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down, Shoot: Boolean;
+  GroundY, Friction: Single;
+  Rad: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    Shoot := (Byte(vkSpace) in FKeys) or (Byte(Ord('J')) in FKeys);
+    if Shoot then
+    begin
+      Exclude(FKeys, vkSpace); Exclude(FKeys, Byte(Ord('J')));
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  // Aiming Phase
+  if not FIsMoving then
+  begin
+    if Up then FAngle := Min(FAngle + 50 * DeltaSec, 90);
+    if Down then FAngle := Max(FAngle - 50 * DeltaSec, 0);
+    if Left then FPower := Max(FPower - 60 * DeltaSec, 10);
+    if Right then FPower := Min(FPower + 60 * DeltaSec, 100);
+    
+    if Shoot then
+    begin
+      FIsMoving := True;
+      Inc(FStrokes);
+      Rad := DegToRad(FAngle);
+      // Power 0-100 maps to velocity 200-1000
+      var Speed := 200 + (FPower * 8);
+      FVelX := Cos(Rad) * Speed;
+      FVelY := -Sin(Rad) * Speed;
+    end;
+  end
+  // Ball Moving Phase
+  else
+  begin
+    // Physics
+    FVelY := FVelY + GRAVITY * DeltaSec;
+    FBallX := FBallX + FVelX * DeltaSec;
+    FBallY := FBallY + FVelY * DeltaSec;
+    
+    GroundY := GetGroundY(FBallX);
+    
+    // Check Hole
+    if (FBallY > GroundY - 10) and (Abs(FBallX - FHoleX) < 10) and (Abs(FVelX) < 200) then
+    begin
+      // Ball is in!
+      FIsMoving := False;
+      FBallX := FHoleX;
+      FBallY := GroundY;
+      FVelX := 0; FVelY := 0;
+      // Reset after 3 secs
+      TThread.CreateAnonymousThread(
+        procedure
+        begin
+          Sleep(3000);
+          TThread.Queue(nil, procedure begin InitHole; end);
+        end).Start;
+      Exit;
+    end;
+    
+    // Ground Collision
+    if FBallY > GroundY then
+    begin
+      FBallY := GroundY;
+      
+      // Bounce if falling fast enough
+      if Abs(FVelY) > 100 then
+      begin
+        FVelY := -FVelY * 0.4; // Bounce damping
+        FVelX := FVelX * 0.7;
+      end
+      else
+      begin
+        // Rolling on ground
+        FVelY := 0;
+        // Friction depends on surface
+        if FBallX > FHoleX - 100 then
+          Friction := 0.95 // Green (Slow friction)
+        else
+          Friction := 0.98; // Fairway (Fast roll)
+          
+        FVelX := FVelX * Friction;
+        
+        if Abs(FVelX) < 10 then
+        begin
+          FVelX := 0;
+          FIsMoving := False;
+        end;
+      end;
+    end;
+    
+    // Out of bounds (behind start)
+    if FBallX < 0 then
+    begin
+      FBallX := 100;
+      FIsMoving := False;
+      FVelX := 0; FVelY := 0;
+    end;
+  end;
+end;
+
+procedure TSkiaGolf.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF87CEEB); // Sky
+  DrawTerrain(ACanvas);
+  DrawBall(ACanvas);
+  if not FIsMoving then
+    DrawAiming(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaGolf.DrawTerrain(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  PB: ISkPathBuilder;
+  I: Integer;
+  GX, GY: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Fairway
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(0, Height);
+  PB.LineTo(0, GetGroundY(0));
+  for I := 0 to 20 do
+  begin
+    GX := I * (Width / 20);
+    GY := GetGroundY(GX);
+    PB.LineTo(GX, GY);
+  end;
+  PB.LineTo(Width, Height);
+  PB.Close;
+  Paint.Color := $FF228B22; // Green
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+
+  // Green (Lighter color near hole)
+  Paint.Color := $FF32CD32;
+  ACanvas.DrawRect(TRectF.Create(FHoleX - 100, GetGroundY(FHoleX), Width, Height), Paint);
+  
+  // Hole
+  Paint.Color := $FF000000;
+  ACanvas.DrawCircle(PointF(FHoleX, GetGroundY(FHoleX) + 2), 8, Paint);
+  
+  // Flag
+  Paint.Color := $FFFF0000;
+  ACanvas.DrawLine(PointF(FHoleX, GetGroundY(FHoleX)), PointF(FHoleX, GetGroundY(FHoleX) - 60), Paint);
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(FHoleX, GetGroundY(FHoleX) - 60);
+  PB.LineTo(FHoleX + 25, GetGroundY(FHoleX) - 50);
+  PB.LineTo(FHoleX, GetGroundY(FHoleX) - 40);
+  PB.Close;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+end;
+
+procedure TSkiaGolf.DrawBall(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFFFFFF;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(FBallX-6, GetGroundY(FBallX)+2, FBallX+6, GetGroundY(FBallX)+6), Paint);
+  Paint.Alpha := 255;
+  
+  // Ball
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawCircle(PointF(FBallX, FBallY), 6, Paint);
+end;
+
+procedure TSkiaGolf.DrawAiming(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  Rad, EndX, EndY: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.StrokeWidth := 3;
+  Paint.Color := $FFFFFFFF;
+  
+  Rad := DegToRad(FAngle);
+  EndX := FBallX + Cos(Rad) * (50 + FPower);
+  EndY := FBallY - Sin(Rad) * (50 + FPower);
+  
+  ACanvas.DrawLine(PointF(FBallX, FBallY), PointF(EndX, EndY), Paint);
+end;
+
+procedure TSkiaGolf.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Power Bar Background
+    Paint.Color := $FF000000;
+    ACanvas.DrawRect(TRectF.Create(20, 20, 40, 220), Paint);
+    // Power Bar Fill
+    Paint.Color := $FF00FF00;
+    ACanvas.DrawRect(TRectF.Create(22, 220 - (FPower * 2), 38, 218), Paint);
+    
+    // Text
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('Strokes: ' + IntToStr(FStrokes), 50, 40, Font, Paint);
+    ACanvas.DrawSimpleText('Angle: ' + IntToStr(Round(FAngle)) + '°', 50, 70, Font, Paint);
+    ACanvas.DrawSimpleText('Power: ' + IntToStr(Round(FPower)) + '%', 50, 100, Font, Paint);
+    ACanvas.DrawSimpleText('W/S: Angle | A/D: Power | Space: Shoot', 50, 130, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaGolf.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaGolf.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaGolf.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaGolf.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaGolf.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

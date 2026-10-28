@@ -1,0 +1,571 @@
+{*******************************************************************************
+  SkiaCatAdventure (Top-Down RPG Prototype)
+********************************************************************************
+  A top-down adventure prototype inspired by Zelda/Star Wars (Gameboy).
+  Features smooth camera scrolling, 4-way animated movement, tree collision,
+  wandering enemies, and a level transition portal.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaCatAdventure;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  TILE = 48;
+  MAP_W = 30;
+  MAP_H = 30;
+
+type
+  TTileType = (ttGrass, ttTree, ttPath, ttPortal);
+
+  TEnemy = class
+    Pos: TPointF;
+    Dir: Integer; // 0=Right, 1=Down, 2=Left, 3=Up
+    Phase: Single;
+  end;
+
+  TSkiaCatAdventure = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMap: array[0..MAP_W-1, 0:: MAP_H-1] of TTileType;
+    FPlayerX, FPlayerY: Single;
+    FPlayerDir: Integer;
+    FAnimPhase: Single;
+    FIsMoving: Boolean;
+    
+    FEnemies: TObjectList<TEnemy>;
+    FPortalPos: TPoint;
+    
+    FCameraX, FCameraY: Single;
+    FLevel: Integer;
+    
+    procedure GenerateMap;
+    function CanWalk(X, Y: Single): Boolean;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawTile(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+    procedure DrawTree(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+    procedure DrawEnemy(const ACanvas: ISkCanvas; En: TEnemy; const OffsetX, OffsetY: Single);
+    procedure DrawPlayer(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TEnemy }
+constructor TEnemy.Create(X, Y: Single);
+begin
+  Pos := PointF(X, Y);
+  Dir := Random(4);
+  Phase := 0;
+end;
+
+{ TSkiaCatAdventure }
+
+constructor TSkiaCatAdventure.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FEnemies := TObjectList<TEnemy>.Create(True);
+  FLevel := 1;
+  GenerateMap;
+  StartThread;
+end;
+
+destructor TSkiaCatAdventure.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FEnemies);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaCatAdventure.GenerateMap;
+var
+  X, Y, I: Integer;
+  En: TEnemy;
+begin
+  FEnemies.Clear;
+  
+  // Generate Grass and Trees
+  for Y := 0 to MAP_H - 1 do
+  begin
+    for X := 0 to MAP_W - 1 do
+    begin
+      if (X = 0) or (Y = 0) or (X = MAP_W - 1) or (Y = MAP_H - 1) then
+        FMap[X, Y] := ttTree // Border
+      else
+        FMap[X, Y] := ttGrass;
+    end;
+  end;
+
+  // Scatter Trees
+  for I := 0 to 80 do
+  begin
+    X := Random(MAP_W - 2) + 1;
+    Y := Random(MAP_H - 2) + 1;
+    if (X <> Trunc(FPlayerX)) and (Y <> Trunc(FPlayerY)) then
+      FMap[X, Y] := ttTree;
+  end;
+
+  // Create a Path
+  for X := 0 to MAP_W - 1 do FMap[X, 15] := ttPath;
+  for Y := 0 to MAP_H - 1 do FMap[15, Y] := ttPath;
+
+  // Spawn Enemies
+  for I := 0 to 3 + FLevel do
+  begin
+    X := Random(MAP_W - 4) + 2;
+    Y := Random(MAP_H - 4) + 2;
+    if FMap[X, Y] = ttGrass then
+    begin
+      En := TEnemy.Create(X * TILE + TILE/2, Y * TILE + TILE/2);
+      FEnemies.Add(En);
+    end;
+  end;
+
+  // Place Portal
+  FPortalPos := Point(Random(MAP_W - 4) + 2, Random(MAP_H - 4) + 2);
+  FMap[FPortalPos.X, FPortalPos.Y] := ttPortal;
+
+  // Player start
+  if FPlayerX = 0 then
+  begin
+    FPlayerX := 2 * TILE + TILE/2;
+    FPlayerY := 2 * TILE + TILE/2;
+    FCameraX := FPlayerX;
+    FCameraY := FPlayerY;
+  end;
+end;
+
+function TSkiaCatAdventure.CanWalk(X, Y: Single): Boolean;
+var
+  GX, GY: Integer;
+begin
+  Result := False;
+  GX := Trunc(X / TILE);
+  GY := Trunc(Y / TILE);
+  if (GX < 0) or (GX >= MAP_W) or (GY < 0) or (GY >= MAP_H) then Exit;
+  Result := FMap[GX, GY] in [ttGrass, ttPath, ttPortal];
+end;
+
+procedure TSkiaCatAdventure.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  Spd, NewX, NewY: Single;
+  I: Integer;
+  En: TEnemy;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  Spd := 180 * DeltaSec;
+  FIsMoving := False;
+  NewX := FPlayerX;
+  NewY := FPlayerY;
+
+  if Left then begin NewX := NewX - Spd; FPlayerDir := 2; FIsMoving := True; end;
+  if Right then begin NewX := NewX + Spd; FPlayerDir := 0; FIsMoving := True; end;
+  if Up then begin NewY := NewY - Spd; FPlayerDir := 3; FIsMoving := True; end;
+  if Down then begin NewY := NewY + Spd; FPlayerDir := 1; FIsMoving := True; end;
+
+  // Collision X
+  if CanWalk(NewX - 10, FPlayerY) and CanWalk(NewX + 10, FPlayerY) then
+    FPlayerX := NewX;
+  // Collision Y
+  if CanWalk(FPlayerX, NewY - 10) and CanWalk(FPlayerX, NewY + 10) then
+    FPlayerY := NewY;
+
+  // Animation
+  if FIsMoving then
+    FAnimPhase := FAnimPhase + DeltaSec * 10
+  else
+    FAnimPhase := 0;
+
+  // Camera Follow
+  FCameraX := FCameraX + (FPlayerX - FCameraX) * 5 * DeltaSec;
+  FCameraY := FCameraY + (FPlayerY - FCameraY) * 5 * DeltaSec;
+
+  // Portal Check
+  if FMap[Trunc(FPlayerX / TILE), Trunc(FPlayerY / TILE)] = ttPortal then
+  begin
+    Inc(FLevel);
+    FPlayerX := 2 * TILE + TILE/2;
+    FPlayerY := 2 * TILE + TILE/2;
+    GenerateMap;
+  end;
+
+  // Enemy Logic
+  for I := 0 to FEnemies.Count - 1 do
+  begin
+    En := FEnemies[I];
+    En.Phase := En.Phase + DeltaSec * 5;
+    
+    // Simple AI: Move in direction, change dir randomly or on wall
+    if Random(100) = 0 then En.Dir := Random(4);
+    
+    case En.Dir of
+      0: En.Pos.X := En.Pos.X + 30 * DeltaSec;
+      1: En.Pos.Y := En.Pos.Y + 30 * DeltaSec;
+      2: En.Pos.X := En.Pos.X - 30 * DeltaSec;
+      3: En.Pos.Y := En.Pos.Y - 30 * DeltaSec;
+    end;
+    
+    // Bounce off walls
+    if not CanWalk(En.Pos.X, En.Pos.Y) then
+    begin
+      case En.Dir of
+        0: En.Pos.X := En.Pos.X - 30 * DeltaSec;
+        1: En.Pos.Y := En.Pos.Y - 30 * DeltaSec;
+        2: En.Pos.X := En.Pos.X + 30 * DeltaSec;
+        3: En.Pos.Y := En.Pos.Y + 30 * DeltaSec;
+      end;
+      En.Dir := Random(4);
+    end;
+  end;
+end;
+
+procedure TSkiaCatAdventure.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  StartX, StartY, EndX, EndY, X, Y: Integer;
+  OffsetX, OffsetY: Single;
+  En: TEnemy;
+begin
+  ACanvas.Clear($FF1a3a1a); // Dark Grass BG
+
+  // Calculate visible tiles only for performance
+  OffsetX := (Width / 2) - FCameraX;
+  OffsetY := (Height / 2) - FCameraY;
+  
+  StartX := Max(0, Trunc((0 - OffsetX) / TILE));
+  StartY := Max(0, Trunc((0 - OffsetY) / TILE));
+  EndX := Min(MAP_W, StartX + Trunc(Width / TILE) + 2);
+  EndY := Min(MAP_H, StartY + Trunc(Height / TILE) + 2);
+
+  // Draw Map
+  for Y := StartY to EndY - 1 do
+  begin
+    for X := StartX to EndX - 1 do
+    begin
+      DrawTile(ACanvas, X, Y, OffsetX, OffsetY);
+      if FMap[X, Y] = ttTree then
+        DrawTree(ACanvas, X, Y, OffsetX, OffsetY);
+    end;
+  end;
+
+  // Draw Enemies
+  for En in FEnemies do
+    DrawEnemy(ACanvas, En, OffsetX, OffsetY);
+
+  // Draw Player
+  DrawPlayer(ACanvas, OffsetX, OffsetY);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaCatAdventure.DrawTile(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+var
+  Rect: TRectF;
+  Paint, Glow: ISkPaint;
+begin
+  Rect := TRectF.Create(Col * TILE + OffsetX, Row * TILE + OffsetY, (Col+1) * TILE + OffsetX, (Row+1) * TILE + OffsetY);
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+
+  case FMap[Col, Row] of
+    ttGrass: begin
+               Paint.Color := $FF3CB371;
+               ACanvas.DrawRect(Rect, Paint);
+               // Grass blades
+               Paint.Color := $FF2E8B57;
+               ACanvas.DrawLine(PointF(Rect.Left+10, Rect.CenterPoint.Y), PointF(Rect.Left+12, Rect.CenterPoint.Y-5), Paint);
+               ACanvas.DrawLine(PointF(Rect.Right-10, Rect.CenterPoint.Y), PointF(Rect.Right-12, Rect.CenterPoint.Y-5), Paint);
+             end;
+    ttPath: begin
+              Paint.Color := $FFC7A978;
+              ACanvas.DrawRect(Rect, Paint);
+            end;
+    ttPortal: begin
+                Paint.Color := $FF3CB371;
+                ACanvas.DrawRect(Rect, Paint);
+                // Draw Portal swirl
+                Glow := TSkPaint.Create(Paint);
+                Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 8.0);
+                Glow.Color := $FF00FFFF;
+                ACanvas.DrawCircle(Rect.CenterPoint, TILE/3, Glow);
+                Paint.Color := $FF0000FF;
+                ACanvas.DrawCircle(Rect.CenterPoint, TILE/4, Paint);
+              end;
+  end;
+end;
+
+procedure TSkiaCatAdventure.DrawTree(const ACanvas: ISkCanvas; Col, Row: Integer; const OffsetX, OffsetY: Single);
+var
+  Rect: TRectF;
+  Paint: ISkPaint;
+begin
+  Rect := TRectF.Create(Col * TILE + OffsetX, Row * TILE + OffsetY, (Col+1) * TILE + OffsetX, (Row+1) * TILE + OffsetY);
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Trunk
+  Paint.Color := $FF8B4513;
+  ACanvas.DrawRect(TRectF.Create(Rect.CenterPoint.X-4, Rect.CenterPoint.Y, Rect.CenterPoint.X+4, Rect.Bottom), Paint);
+  // Leaves
+  Paint.Color := $FF228B22;
+  ACanvas.DrawCircle(Rect.CenterPoint, TILE/3, Paint);
+  Paint.Color := $FF006400;
+  ACanvas.DrawCircle(PointF(Rect.CenterPoint.X-10, Rect.CenterPoint.Y-5), TILE/4, Paint);
+  ACanvas.DrawCircle(PointF(Rect.CenterPoint.X+10, Rect.CenterPoint.Y-5), TILE/4, Paint);
+end;
+
+procedure TSkiaCatAdventure.DrawEnemy(const ACanvas: ISkCanvas; En: TEnemy; const OffsetX, OffsetY: Single);
+var
+  Paint, Glow: ISkPaint;
+  CX, CY: Single;
+begin
+  CX := En.Pos.X + OffsetX;
+  CY := En.Pos.Y + OffsetY;
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 60;
+  ACanvas.DrawOval(TRectF.Create(CX-10, CY+8, CX+10, CY+14), Paint);
+  Paint.Alpha := 255;
+  
+  // Body
+  Glow := TSkPaint.Create(Paint);
+  Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 4.0);
+  Glow.Color := $FFFF0000;
+  ACanvas.DrawCircle(PointF(CX, CY), 12, Glow);
+  Paint.Color := $FF8B0000;
+  ACanvas.DrawCircle(PointF(CX, CY), 12, Paint);
+  
+  // Eyes
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawCircle(PointF(CX-4, CY-2), 3, Paint);
+  ACanvas.DrawCircle(PointF(CX+4, CY-2), 3, Paint);
+end;
+
+procedure TSkiaCatAdventure.DrawPlayer(const ACanvas: ISkCanvas; const OffsetX, OffsetY: Single);
+var
+  Paint, Glow: ISkPaint;
+  CX, CY: Single;
+  Breathe: Single;
+  LegOffset: Single;
+begin
+  CX := FPlayerX + OffsetX;
+  CY := FPlayerY + OffsetY;
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 60;
+  ACanvas.DrawOval(TRectF.Create(CX-12, CY+10, CX+12, CY+16), Paint);
+  Paint.Alpha := 255;
+  
+  // Body
+  Glow := TSkPaint.Create(Paint);
+  Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 4.0);
+  Glow.Color := $FF00FFFF;
+  
+  if FIsMoving then
+  begin
+    LegOffset := Sin(FAnimPhase) * 3;
+    Breathe := 0;
+  end
+  else
+  begin
+    LegOffset := 0;
+    Breathe := Sin(FAnimPhase * 0.2) * 1.0;
+  end;
+  
+  // Simple Cat Body (Side view abstract)
+  ACanvas.DrawOval(TRectF.Create(CX-12, CY-2-Breathe, CX+12, CY+8+Breathe), Glow);
+  Paint.Color := $FF2a2a2a;
+  ACanvas.DrawOval(TRectF.Create(CX-12, CY-2-Breathe, CX+12, CY+8+Breathe), Paint);
+  
+  // Legs
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 3;
+  Paint.StrokeCap := TSkStrokeCap.Round;
+  ACanvas.DrawLine(PointF(CX-8, CY+8), PointF(CX-8 + LegOffset, CY+14), Paint);
+  ACanvas.DrawLine(PointF(CX-4, CY+8), PointF(CX-4 - LegOffset, CY+14), Paint);
+  ACanvas.DrawLine(PointF(CX+4, CY+8), PointF(CX+4 + LegOffset, CY+14), Paint);
+  ACanvas.DrawLine(PointF(CX+8, CY+8), PointF(CX+8 - LegOffset, CY+14), Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+  
+  // Head (Offset by direction)
+  var HeadX: Single := CX;
+  var HeadY: Single := CY - 10;
+  if FPlayerDir = 0 then HeadX := HeadX + 4; // Right
+  if FPlayerDir = 2 then HeadX := HeadX - 4; // Left
+  
+  ACanvas.DrawCircle(PointF(HeadX, HeadY), 7, Glow);
+  Paint.Color := $FF2a2a2a;
+  ACanvas.DrawCircle(PointF(HeadX, HeadY), 7, Paint);
+  
+  // Ears
+  Paint.Color := $FF222222;
+  ACanvas.DrawLine(PointF(HeadX-5, HeadY-4), PointF(HeadX-3, HeadY-9), Paint);
+  ACanvas.DrawLine(PointF(HeadX+5, HeadY-4), PointF(HeadX+3, HeadY-9), Paint);
+  
+  // Tail
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.Color := $FF2a2a2a;
+  var TailWag := Sin(FAnimPhase * 1.5) * 4;
+  if FPlayerDir = 0 then // Tail left if going right
+    ACanvas.DrawLine(PointF(CX-10, CY+2), PointF(CX-15, CY-5 + TailWag), Paint)
+  else if FPlayerDir = 2 then // Tail right if going left
+    ACanvas.DrawLine(PointF(CX+10, CY+2), PointF(CX+15, CY-5 + TailWag), Paint)
+  else
+    ACanvas.DrawLine(PointF(CX+10, CY+2), PointF(CX+15, CY-5 + TailWag), Paint);
+end;
+
+procedure TSkiaCatAdventure.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD/Arrows: Move | Find the Blue Portal to advance Level', 10, 30, Font, Paint);
+    
+    Paint.Color := TAlphaColors.Yellow;
+    ACanvas.DrawSimpleText('Level: ' + IntToStr(FLevel), 10, 50, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaCatAdventure.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaCatAdventure.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaCatAdventure.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaCatAdventure.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaCatAdventure.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

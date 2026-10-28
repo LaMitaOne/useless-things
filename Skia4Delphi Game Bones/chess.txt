@@ -1,0 +1,479 @@
+{*******************************************************************************
+  SkiaChess (Board Logic Prototype)
+********************************************************************************
+  A fully playable local 2-player chess prototype. Features grid-based logic, 
+  move validation for all piece types (including L-jumps for knights), 
+  and capture detection.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaChess;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  TILE = 70;
+
+type
+  TPieceType = (ptNone, ptPawn, ptRook, ptKnight, ptBishop, ptQueen, ptKing);
+  TPieceColor = (pcNone, pcWhite, pcBlack);
+
+  TTile = record
+    Piece: TPieceType;
+    Color: TPieceColor;
+    HasMoved: Boolean;
+  end;
+
+  TSkiaChessGame = class(TSkCustomControl)
+  private
+    FBoard: array[0..7, 0..7] of TTile;
+    FSelectedX, FSelectedY: Integer;
+    FValidMoves: TList<TPoint>;
+    FCurrentTurn: TPieceColor;
+    FMessage: string;
+    
+    procedure InitBoard;
+    function GetTileAtScreen(X, Y: Single; out Col, Row: Integer): Boolean;
+    procedure CalculateValidMoves(Col, Row: Integer);
+    function IsEnemy(Col, Row: Integer; C: TPieceColor): Boolean;
+    function IsAlly(Col, Row: Integer; C: TPieceColor): Boolean;
+    function IsValid(Col, Row: Integer): Boolean;
+    procedure DoLogicUpdate;
+    procedure SafeInvalidate;
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaChessGame }
+
+constructor TSkiaChessGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  
+  FValidMoves := TList<TPoint>.Create;
+  FSelectedX := -1;
+  FSelectedY := -1;
+  FCurrentTurn := pcWhite;
+  FMessage := 'White''s turn. Click a piece to select.';
+  InitBoard;
+end;
+
+destructor TSkiaChessGame.Destroy;
+begin
+  FreeAndNil(FValidMoves);
+  inherited;
+end;
+
+procedure TSkiaChessGame.InitBoard;
+var
+  C, R: Integer;
+begin
+  for R := 0 to 7 do
+    for C := 0 to 7 do
+    begin
+      FBoard[C, R].Piece := ptNone;
+      FBoard[C, R].Color := pcNone;
+      FBoard[C, R].HasMoved := False;
+    end;
+
+  // Pawns
+  for C := 0 to 7 do
+  begin
+    FBoard[C, 1].Piece := ptPawn; FBoard[C, 1].Color := pcBlack;
+    FBoard[C, 6].Piece := ptPawn; FBoard[C, 6].Color := pcWhite;
+  end;
+
+  // Rooks
+  FBoard[0, 0].Piece := ptRook; FBoard[0, 0].Color := pcBlack;
+  FBoard[7, 0].Piece := ptRook; FBoard[7, 0].Color := pcBlack;
+  FBoard[0, 7].Piece := ptRook; FBoard[0, 7].Color := pcWhite;
+  FBoard[7, 7].Piece := ptRook; FBoard[7, 7].Color := pcWhite;
+
+  // Knights
+  FBoard[1, 0].Piece := ptKnight; FBoard[1, 0].Color := pcBlack;
+  FBoard[6, 0].Piece := ptKnight; FBoard[6, 0].Color := pcBlack;
+  FBoard[1, 7].Piece := ptKnight; FBoard[1, 7].Color := pcWhite;
+  FBoard[6, 7].Piece := ptKnight; FBoard[6, 7].Color := pcWhite;
+
+  // Bishops
+  FBoard[2, 0].Piece := ptBishop; FBoard[2, 0].Color := pcBlack;
+  FBoard[5, 0].Piece := ptBishop; FBoard[5, 0].Color := pcBlack;
+  FBoard[2, 7].Piece := ptBishop; FBoard[2, 7].Color := pcWhite;
+  FBoard[5, 7].Piece := ptBishop; FBoard[5, 7].Color := pcWhite;
+
+  // Queens & Kings
+  FBoard[3, 0].Piece := ptQueen; FBoard[3, 0].Color := pcBlack;
+  FBoard[4, 0].Piece := ptKing; FBoard[4, 0].Color := pcBlack;
+  FBoard[3, 7].Piece := ptQueen; FBoard[3, 7].Color := pcWhite;
+  FBoard[4, 7].Piece := ptKing; FBoard[4, 7].Color := pcWhite;
+end;
+
+function TSkiaChessGame.IsValid(Col, Row: Integer): Boolean;
+begin
+  Result := (Col >= 0) and (Col < 8) and (Row >= 0) and (Row < 8);
+end;
+
+function TSkiaChessGame.IsEnemy(Col, Row: Integer; C: TPieceColor): Boolean;
+begin
+  if not IsValid(Col, Row) then Exit(False);
+  if FBoard[Col, Row].Color = pcNone then Exit(False);
+  Result := FBoard[Col, Row].Color <> C;
+end;
+
+function TSkiaChessGame.IsAlly(Col, Row: Integer; C: TPieceColor): Boolean;
+begin
+  if not IsValid(Col, Row) then Exit(False);
+  Result := FBoard[Col, Row].Color = C;
+end;
+
+procedure TSkiaChessGame.CalculateValidMoves(Col, Row: Integer);
+var
+  P: TTile;
+  C: TPieceColor;
+  I, Dir: Integer;
+  DX, DY: Integer;
+begin
+  FValidMoves.Clear;
+  if not IsValid(Col, Row) then Exit;
+  
+  P := FBoard[Col, Row];
+  C := P.Color;
+  if C = pcNone then Exit;
+
+  case P.Piece of
+    ptPawn: begin
+              Dir := -1; // White moves up (decreasing Y)
+              if C = pcBlack then Dir := 1;
+              
+              // Move forward
+              if IsValid(Col, Row + Dir) and (FBoard[Col, Row + Dir].Color = pcNone) then
+              begin
+                FValidMoves.Add(Point(Col, Row + Dir));
+                // Double move from start
+                if not P.HasMoved then
+                  if IsValid(Col, Row + Dir*2) and (FBoard[Col, Row + Dir*2].Color = pcNone) then
+                    FValidMoves.Add(Point(Col, Row + Dir*2));
+              end;
+              // Capture diagonally
+              if IsEnemy(Col - 1, Row + Dir, C) then FValidMoves.Add(Point(Col - 1, Row + Dir));
+              if IsEnemy(Col + 1, Row + Dir, C) then FValidMoves.Add(Point(Col + 1, Row + Dir));
+            end;
+    ptRook: begin
+              for I := 1 to 7 do
+              begin
+                if IsAlly(Col+I, Row, C) then Break;
+                if IsValid(Col+I, Row) then FValidMoves.Add(Point(Col+I, Row));
+                if IsEnemy(Col+I, Row, C) then Break;
+              end;
+              for I := 1 to 7 do
+              begin
+                if IsAlly(Col-I, Row, C) then Break;
+                if IsValid(Col-I, Row) then FValidMoves.Add(Point(Col-I, Row));
+                if IsEnemy(Col-I, Row, C) then Break;
+              end;
+              for I := 1 to 7 do
+              begin
+                if IsAlly(Col, Row+I, C) then Break;
+                if IsValid(Col, Row+I) then FValidMoves.Add(Point(Col, Row+I));
+                if IsEnemy(Col, Row+I, C) then Break;
+              end;
+              for I := 1 to 7 do
+              begin
+                if IsAlly(Col, Row-I, C) then Break;
+                if IsValid(Col, Row-I) then FValidMoves.Add(Point(Col, Row-I));
+                if IsEnemy(Col, Row-I, C) then Break;
+              end;
+            end;
+    ptKnight: begin
+                // L-Shapes
+                for DX := -2 to 2 do
+                  for DY := -2 to 2 do
+                  begin
+                    if (Abs(DX) = 2) and (Abs(DY) = 1) or (Abs(DX) = 1) and (Abs(DY) = 2) then
+                    begin
+                      if IsValid(Col+DX, Row+DY) and not IsAlly(Col+DX, Row+DY, C) then
+                        FValidMoves.Add(Point(Col+DX, Row+DY));
+                    end;
+                  end;
+              end;
+    ptBishop: begin
+                for I := 1 to 7 do
+                begin
+                  if IsAlly(Col+I, Row+I, C) then Break;
+                  if IsValid(Col+I, Row+I) then FValidMoves.Add(Point(Col+I, Row+I));
+                  if IsEnemy(Col+I, Row+I, C) then Break;
+                end;
+                for I := 1 to 7 do
+                begin
+                  if IsAlly(Col+I, Row-I, C) then Break;
+                  if IsValid(Col+I, Row-I) then FValidMoves.Add(Point(Col+I, Row-I));
+                  if IsEnemy(Col+I, Row-I, C) then Break;
+                end;
+                for I := 1 to 7 do
+                begin
+                  if IsAlly(Col-I, Row+I, C) then Break;
+                  if IsValid(Col-I, Row+I) then FValidMoves.Add(Point(Col-I, Row+I));
+                  if IsEnemy(Col-I, Row+I, C) then Break;
+                end;
+                for I := 1 to 7 do
+                begin
+                  if IsAlly(Col-I, Row-I, C) then Break;
+                  if IsValid(Col-I, Row-I) then FValidMoves.Add(Point(Col-I, Row-I));
+                  if IsEnemy(Col-I, Row-I, C) then Break;
+                end;
+              end;
+    ptQueen: begin
+               // Rook + Bishop logic combined
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col+I, Row, C) then Break;
+                 if IsValid(Col+I, Row) then FValidMoves.Add(Point(Col+I, Row));
+                 if IsEnemy(Col+I, Row, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col-I, Row, C) then Break;
+                 if IsValid(Col-I, Row) then FValidMoves.Add(Point(Col-I, Row));
+                 if IsEnemy(Col-I, Row, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col, Row+I, C) then Break;
+                 if IsValid(Col, Row+I) then FValidMoves.Add(Point(Col, Row+I));
+                 if IsEnemy(Col, Row+I, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col, Row-I, C) then Break;
+                 if IsValid(Col, Row-I) then FValidMoves.Add(Point(Col, Row-I));
+                 if IsEnemy(Col, Row-I, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col+I, Row+I, C) then Break;
+                 if IsValid(Col+I, Row+I) then FValidMoves.Add(Point(Col+I, Row+I));
+                 if IsEnemy(Col+I, Row+I, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col+I, Row-I, C) then Break;
+                 if IsValid(Col+I, Row-I) then FValidMoves.Add(Point(Col+I, Row-I));
+                 if IsEnemy(Col+I, Row-I, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col-I, Row+I, C) then Break;
+                 if IsValid(Col-I, Row+I) then FValidMoves.Add(Point(Col-I, Row+I));
+                 if IsEnemy(Col-I, Row+I, C) then Break;
+               end;
+               for I := 1 to 7 do
+               begin
+                 if IsAlly(Col-I, Row-I, C) then Break;
+                 if IsValid(Col-I, Row-I) then FValidMoves.Add(Point(Col-I, Row-I));
+                 if IsEnemy(Col-I, Row-I, C) then Break;
+               end;
+             end;
+    ptKing: begin
+              for DX := -1 to 1 do
+                for DY := -1 to 1 do
+                begin
+                  if (DX = 0) and (DY = 0) then Continue;
+                  if IsValid(Col+DX, Row+DY) and not IsAlly(Col+DX, Row+DY, C) then
+                    FValidMoves.Add(Point(Col+DX, Row+DY));
+                end;
+            end;
+  end;
+end;
+
+function TSkiaChessGame.GetTileAtScreen(X, Y: Single; out Col, Row: Integer): Boolean;
+var
+  OffsetX, OffsetY: Single;
+begin
+  OffsetX := (Width - (8 * TILE)) / 2;
+  OffsetY := (Height - (8 * TILE)) / 2;
+  
+  Col := Trunc((X - OffsetX) / TILE);
+  Row := Trunc((Y - OffsetY) / TILE);
+  Result := IsValid(Col, Row);
+end;
+
+procedure TSkiaChessGame.DoLogicUpdate;
+begin
+  // Chess doesn't need per-frame logic updates, only event-driven ones
+end;
+
+procedure TSkiaChessGame.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  Col, Row: Integer;
+  I: Integer;
+  Move: TPoint;
+  PieceTaken: TPieceType;
+  ColorTaken: TPieceColor;
+begin
+  if GetTileAtScreen(X, Y, Col, Row) then
+  begin
+    // If we have a piece selected, try to move
+    if FSelectedX >= 0 then
+    begin
+      for I := 0 to FValidMoves.Count - 1 do
+      begin
+        Move := FValidMoves[I];
+        if (Move.X = Col) and (Move.Y = Row) then
+        begin
+          PieceTaken := FBoard[Col, Row].Piece;
+          ColorTaken := FBoard[Col, Row].Color;
+          
+          // Move Piece
+          FBoard[Col, Row] := FBoard[FSelectedX, FSelectedY];
+          FBoard[Col, Row].HasMoved := True;
+          FBoard[FSelectedX, FSelectedY].Piece := ptNone;
+          FBoard[FSelectedX, FSelectedY].Color := pcNone;
+          
+          // Check Win
+          if PieceTaken = ptKing then
+          begin
+            if ColorTaken = pcWhite then
+              FMessage := 'BLACK WINS! Resetting...'
+            else
+              FMessage := 'WHITE WINS! Resetting...';
+            FSelectedX := -1;
+            FValidMoves.Clear;
+            Repaint;
+            Sleep(3000);
+            InitBoard;
+            FCurrentTurn := pcWhite;
+            FMessage := 'White''s turn.';
+            Repaint;
+            Exit;
+          end;
+          
+          // Switch Turn
+          if FCurrentTurn = pcWhite then FCurrentTurn := pcBlack else FCurrentTurn := pcWhite;
+          FMessage := IfThen(FCurrentTurn = pcWhite, 'White''s turn.', 'Black''s turn.');
+          
+          FSelectedX := -1;
+          FValidMoves.Clear;
+          Repaint;
+          Exit;
+        end;
+      end;
+    end;
+    
+    // Select Piece
+    if FBoard[Col, Row].Color = FCurrentTurn then
+    begin
+      FSelectedX := Col;
+      FSelectedY := Row;
+      CalculateValidMoves(Col, Row);
+      Repaint;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaChessGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  C, R: Integer;
+  OffsetX, OffsetY: Single;
+  Rect: TRectF;
+  Paint, GlowPaint: ISkPaint;
+  Font: TSkFont;
+  Move: TPoint;
+  PieceSymbol: string;
+begin
+  ACanvas.Clear($FF222222);
+  
+  OffsetX := (Width - (8 * TILE)) / 2;
+  OffsetY := (Height - (8 * TILE)) / 2;
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Font := TSkFont.Create;
+  Font.Size := 40;
+  
+  for R := 0 to 7 do
+  begin
+    for C := 0 to 7 do
+    begin
+      Rect := TRectF.Create(C * TILE + OffsetX, R * TILE + OffsetY, (C+1) * TILE + OffsetX, (R+1) * TILE + OffsetY);
+      
+      // Board Colors
+      if (C + R) mod 2 = 0 then Paint.Color := $FFEEEEEE else Paint.Color := $FF555555;
+      ACanvas.DrawRect(Rect, Paint);
+      
+      // Highlight Selected
+      if (FSelectedX = C) and (FSelectedY = R) then
+      begin
+        Paint.Color := $FFAAAA00;
+        Paint.Alpha := 100;
+        ACanvas.DrawRect(Rect, Paint);
+        Paint.Alpha := 255;
+      end;
+      
+      // Highlight Valid Moves
+      for Move in FValidMoves do
+      begin
+        if (Move.X = C) and (Move.Y = R) then
+        begin
+          if FBoard[C, R].Color = pcNone then
+            Paint.Color := $FF00FF00 // Green for move
+          else
+            Paint.Color := $FFFF0000; // Red for capture
+          Paint.Alpha := 100;
+          ACanvas.DrawRect(Rect, Paint);
+          Paint.Alpha := 255;
+        end;
+      end;
+      
+      // Draw Piece
+      if FBoard[C, R].Piece <> ptNone then
+      begin
+        case FBoard[C, R].Piece of
+          ptPawn: PieceSymbol := 'P';
+          ptRook: PieceSymbol := 'R';
+          ptKnight: PieceSymbol := 'N';
+          ptBishop: PieceSymbol := 'B';
+          ptQueen: PieceSymbol := 'Q';
+          ptKing: PieceSymbol := 'K';
+        end;
+        
+        if FBoard[C, R].Color = pcWhite then
+          Paint.Color := $FFFFFFFF
+        else
+          Paint.Color := $FF000000;
+          
+        ACanvas.DrawSimpleText(PieceSymbol, Rect.CenterPoint.X - 12, Rect.CenterPoint.Y + 15, Font, Paint);
+      end;
+    end;
+  end;
+  
+  // Draw Message
+  Paint.Color := $FFFFFFFF;
+  ACanvas.DrawSimpleText(FMessage, 20, 30, Font, Paint);
+  
+  Font.Free;
+end;
+
+procedure TSkiaChessGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil, procedure begin Repaint; end);
+end;
+
+end.

@@ -1,0 +1,426 @@
+{*******************************************************************************
+  SkiaPseudoRacing (OutRun Style Prototype)
+********************************************************************************
+  A pseudo-3D racing prototype inspired by OutRun/Pole Position.
+  Uses a segment-based road projection system to simulate 3D depth and curves 
+  without any actual 3D polygons.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaPseudoRacing;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TRoadSegment = record
+    Z: Single;      // Distance from camera
+    X: Single;      // Center offset for curves
+    Color: Integer; // 0=Dark, 1=Light (for rumble strips)
+  end;
+
+  TSkiaPseudoRacing = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FRoad: TList<TRoadSegment>;
+    FCameraZ: Single;
+    FSpeed: Single;
+    FPlayerX: Single; // -1.0 to 1.0 (Left to Right on road)
+    FMaxSpeed: Single;
+    FScore: Single;
+    
+    procedure InitRoad;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawRoad(const ACanvas: ISkCanvas);
+    procedure DrawBackground(const ACanvas: ISkCanvas);
+    procedure DrawCockpit(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+const
+  SEGMENT_LENGTH = 200;
+  ROAD_WIDTH = 1500;
+  CAMERA_HEIGHT = 1000;
+  DRAW_DISTANCE = 200; // How many segments to draw ahead
+
+{ TSkiaPseudoRacing }
+
+constructor TSkiaPseudoRacing.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FRoad := TList<TRoadSegment>.Create;
+  FMaxSpeed := 15000;
+  InitRoad;
+  StartThread;
+end;
+
+destructor TSkiaPseudoRacing.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FRoad);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaPseudoRacing.InitRoad;
+var
+  I: Integer;
+  Seg: TRoadSegment;
+begin
+  FRoad.Clear;
+  FCameraZ := 0;
+  FSpeed := 0;
+  FPlayerX := 0;
+  FScore := 0;
+  
+  // Generate 2000 segments
+  for I := 0 to 2000 do
+  begin
+    Seg.Z := I * SEGMENT_LENGTH;
+    Seg.X := 0;
+    Seg.Color := I mod 2;
+    FRoad.Add(Seg);
+  end;
+  
+  // Add some curves (Shift X offset)
+  for I := 500 to 700 do FRoad[I].X := (I - 500) * 2;
+  for I := 700 to 900 do FRoad[I].X := 1400 - ((I - 700) * 2);
+  
+  for I := 1200 to 1500 do FRoad[I].X := -(I - 1200) * 1.5;
+end;
+
+procedure TSkiaPseudoRacing.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down: Boolean;
+  CurrentSegIdx: Integer;
+  CurrentSeg: TRoadSegment;
+  Centrifugal: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // Acceleration / Brake
+  if Up then
+    FSpeed := Min(FSpeed + 5000 * DeltaSec, FMaxSpeed)
+  else if Down then
+    FSpeed := Max(FSpeed - 10000 * DeltaSec, 0)
+  else
+    FSpeed := Max(FSpeed - 1000 * DeltaSec, 0); // Engine friction
+
+  // Off-road slowdown
+  if Abs(FPlayerX) > 1.0 then
+    FSpeed := Max(FSpeed - 5000 * DeltaSec, FMaxSpeed / 4);
+
+  // Move Camera
+  FCameraZ := FCameraZ + FSpeed * DeltaSec;
+  if FCameraZ >= (FRoad.Count - DRAW_DISTANCE) * SEGMENT_LENGTH then
+    FCameraZ := 0; // Loop track
+
+  // Steering
+  CurrentSegIdx := Trunc(FCameraZ / SEGMENT_LENGTH) mod FRoad.Count;
+  CurrentSeg := FRoad[CurrentSegIdx];
+  
+  // Centrifugal force (Pushes car out in curves)
+  Centrifugal := (CurrentSeg.X / 1000) * (FSpeed / FMaxSpeed) * 2;
+  
+  if Left then FPlayerX := FPlayerX - 1.5 * DeltaSec * (FSpeed/5000);
+  if Right then FPlayerX := FPlayerX + 1.5 * DeltaSec * (FSpeed/5000);
+  
+  FPlayerX := FPlayerX - Centrifugal * DeltaSec;
+  FPlayerX := EnsureRange(FPlayerX, -2.5, 2.5);
+
+  // Score
+  FScore := FScore + FSpeed * DeltaSec * 0.01;
+end;
+
+procedure TSkiaPseudoRacing.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF87CEEB); // Sky
+  
+  DrawBackground(ACanvas);
+  DrawRoad(ACanvas);
+  DrawCockpit(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaPseudoRacing.DrawBackground(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  PB: ISkPathBuilder;
+begin
+  // Distant Mountains
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FF556677;
+  
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(0, Height * 0.5);
+  PB.LineTo(Width * 0.2, Height * 0.3);
+  PB.LineTo(Width * 0.4, Height * 0.45);
+  PB.LineTo(Width * 0.6, Height * 0.25);
+  PB.LineTo(Width * 0.8, Height * 0.4);
+  PB.LineTo(Width, Height * 0.5);
+  PB.LineTo(Width, Height * 0.6);
+  PB.LineTo(0, Height * 0.6);
+  PB.Close;
+  
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+end;
+
+procedure TSkiaPseudoRacing.DrawRoad(const ACanvas: ISkCanvas);
+var
+  I, BaseIdx: Integer;
+  Seg1, Seg2: TRoadSegment;
+  Scale1, Scale2: Single;
+  X1, X2, Y1, Y2: Single;
+  W1, W2: Single;
+  Paint: ISkPaint;
+  PB: ISkPathBuilder;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+
+  BaseIdx := Trunc(FCameraZ / SEGMENT_LENGTH);
+
+  for I := DRAW_DISTANCE downto 1 do
+  begin
+    Seg1 := FRoad[(BaseIdx + I - 1) mod FRoad.Count];
+    Seg2 := FRoad[(BaseIdx + I) mod FRoad.Count];
+    
+    // Adjust Z relative to camera
+    Seg1.Z := Seg1.Z - FCameraZ;
+    Seg2.Z := Seg2.Z - FCameraZ;
+    
+    if Seg2.Z <= 0 then Continue; // Behind camera
+
+    // Project to 2D (Perspective formula: scale = 1 / Z)
+    Scale1 := CAMERA_HEIGHT / Max(1, Seg1.Z);
+    Scale2 := CAMERA_HEIGHT / Max(1, Seg2.Z);
+    
+    // Screen Y (Horizon is at 0.6 * Height)
+    Y1 := Height * 0.6 - Scale1 * 100;
+    Y2 := Height * 0.6 - Scale2 * 100;
+    
+    // Road X and Width
+    X1 := (Width / 2) + (Seg1.X - FPlayerX * ROAD_WIDTH) * Scale1;
+    X2 := (Width / 2) + (Seg2.X - FPlayerX * ROAD_WIDTH) * Scale2;
+    
+    W1 := ROAD_WIDTH * Scale1;
+    W2 := ROAD_WIDTH * Scale2;
+    
+    // Draw Grass
+    Paint.Color := IfThen(Seg1.Color = 0, $FF22AA22, $FF1E8C1E);
+    ACanvas.DrawRect(TRectF.Create(0, Y1, Width, Y2), Paint);
+    
+    // Draw Road
+    Paint.Color := IfThen(Seg1.Color = 0, $FF444444, $FF3A3A3A);
+    ACanvas.DrawRect(TRectF.Create(X1 - W1/2, Y1, X1 + W1/2, Y2), Paint);
+
+    // Draw Rumble Strips (Red/White edges)
+    Paint.Color := IfThen(Seg1.Color = 0, $FFFFFFFF, $FFFF0000);
+    ACanvas.DrawRect(TRectF.Create(X1 - W1/2 - (W1*0.1), Y1, X1 - W1/2, Y2), Paint);
+    ACanvas.DrawRect(TRectF.Create(X1 + W1/2, Y1, X1 + W1/2 + (W1*0.1), Y2), Paint);
+
+    // Draw Center Line
+    if Seg1.Color = 0 then
+    begin
+      Paint.Color := $FFFFFFFF;
+      ACanvas.DrawRect(TRectF.Create(X1 - 5*Scale1, Y1, X1 + 5*Scale1, Y2), Paint);
+    end;
+  end;
+end;
+
+procedure TSkiaPseudoRacing.DrawCockpit(const ACanvas: ISkCanvas);
+var
+  Paint, Glow: ISkPaint;
+  PB: ISkPathBuilder;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Dashboard
+  Paint.Color := $FF111111;
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(0, Height);
+  PB.LineTo(0, Height * 0.75);
+  PB.LineTo(Width * 0.2, Height * 0.7);
+  PB.LineTo(Width * 0.8, Height * 0.7);
+  PB.LineTo(Width, Height * 0.75);
+  PB.LineTo(Width, Height);
+  PB.Close;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+  
+  // Steering Wheel
+  Paint.Color := $FF333333;
+  ACanvas.DrawCircle(PointF(Width/2, Height * 0.85), 80, Paint);
+  Paint.Color := $FF222222;
+  ACanvas.DrawCircle(PointF(Width/2, Height * 0.85), 70, Paint);
+  
+  // Wheel rotation indicator
+  Paint.Color := $FFFF0000;
+  ACanvas.Save;
+  ACanvas.Translate(Width/2, Height * 0.85);
+  ACanvas.Rotate(FPlayerX * -45);
+  ACanvas.DrawRect(TRectF.Create(-5, -65, 5, -55), Paint);
+  ACanvas.Restore;
+end;
+
+procedure TSkiaPseudoRacing.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Speedometer
+    Paint.Color := $FFFFFFFF;
+    Paint.Style := TSkPaintStyle.Stroke;
+    Paint.StrokeWidth := 4;
+    ACanvas.DrawArc(TRectF.Create(Width - 160, 20, Width - 20, 160), 180, -180, False, Paint);
+    Paint.Style := TSkPaintStyle.Fill;
+    
+    // Speed Needle
+    Paint.Color := $FFFF0000;
+    ACanvas.Save;
+    ACanvas.Translate(Width - 90, 100);
+    ACanvas.Rotate(180 - ((FSpeed / FMaxSpeed) * 180));
+    ACanvas.DrawLine(TPointF.Zero, PointF(0, -60), Paint);
+    ACanvas.Restore;
+    
+    // Text
+    Paint.Color := $FFFFFFFF;
+    ACanvas.DrawSimpleText('Speed: ' + IntToStr(Trunc(FSpeed/100)) + ' km/h', Width - 160, 180, Font, Paint);
+    ACanvas.DrawSimpleText('Score: ' + IntToStr(Trunc(FScore)), 20, 40, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaPseudoRacing.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vtkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaPseudoRacing.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vtkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaPseudoRacing.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaPseudoRacing.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaPseudoRacing.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

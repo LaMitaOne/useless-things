@@ -1,0 +1,502 @@
+{*******************************************************************************
+  SkiaSummerGames (QTE Sports Prototype)
+********************************************************************************
+  A sports prototype inspired by Track & Field / Summer Games. 
+  Features button-mashing speed mechanics, timing-based hurdles, and basic AI.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaSummerGames;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TGameMode = (gmHurdles, gmLongJump, gmWin);
+
+  TAthlete = class
+    Pos: TPointF;
+    Speed: Single;
+    JumpVel: Single;
+    OnGround: Boolean;
+    IsPlayer: Boolean;
+    Crashed: Boolean;
+    JumpDist: Single;
+    Color: TAlphaColor;
+  end;
+
+  TSkiaSummerGames = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FMode: TGameMode;
+    FPlayer: TAthlete;
+    FAI: TAthlete;
+    FObstacles: TList<Single>;
+    FTimer: Single;
+    FMessage: string;
+    FLastKey: Byte;
+    
+    procedure InitHurdles;
+    procedure InitLongJump;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawTrack(const ACanvas: ISkCanvas);
+    procedure DrawAthletes(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaSummerGames }
+
+constructor TSkiaSummerGames.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FPlayer := TAthlete.Create; FPlayer.Color := $FF00FFFF; FPlayer.IsPlayer := True;
+  FAI := TAthlete.Create; FAI.Color := $FFFF0000; FAI.IsPlayer := False;
+  FObstacles := TList<Single>.Create;
+  
+  InitHurdles;
+  StartThread;
+end;
+
+destructor TSkiaSummerGames.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FPlayer);
+  FreeAndNil(FAI);
+  FreeAndNil(FObstacles);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaSummerGames.InitHurdles;
+var
+  I: Integer;
+begin
+  FMode := gmHurdles;
+  FObstacles.Clear;
+  FPlayer.Pos := PointF(100, 300); FPlayer.Speed := 0; FPlayer.OnGround := True; FPlayer.Crashed := False;
+  FAI.Pos := PointF(100, 350); FAI.Speed := 0; FAI.OnGround := True; FAI.Crashed := False;
+  
+  // Place Hurdles
+  for I := 1 to 5 do
+    FObstacles.Add(I * 300);
+    
+  FMessage := 'Tap A/D to Run! Space to Jump!';
+  FTimer := 3.0; // Countdown
+end;
+
+procedure TSkiaSummerGames.InitLongJump;
+begin
+  FMode := gmLongJump;
+  FPlayer.Pos := PointF(100, 300); FPlayer.Speed := 0; FPlayer.OnGround := True; FPlayer.Crashed := False;
+  FObstacles.Clear;
+  FObstacles.Add(800); // The Takeoff Board
+  FObstacles.Add(1000); // The Sandpit (Calculated by distance)
+  FMessage := 'Tap A/D to Run! Space at Board to Jump!';
+  FTimer := 3.0;
+end;
+
+procedure TSkiaSummerGames.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Jump: Boolean;
+  I: Integer;
+  Obs: Single;
+  Dist: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := Byte(Ord('A')) in FKeys;
+    Right := Byte(Ord('D')) in FKeys;
+    Jump := Byte(vkSpace) in FKeys;
+    if Jump then
+    begin
+      Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  // Countdown
+  if FTimer > 0 then
+  begin
+    FTimer := FTimer - DeltaSec;
+    if FTimer <= 0 then
+      FMessage := 'GO!';
+    Exit;
+  end;
+
+  if FMode = gmWin then
+  begin
+    FTimer := FTimer - DeltaSec;
+    if FTimer <= 0 then InitHurdles;
+    Exit;
+  end;
+
+  // --- BUTTON MASHING LOGIC ---
+  // Player must alternate A and D to build speed
+  if FPlayer.OnGround and not FPlayer.Crashed then
+  begin
+    if Left and (FLastKey <> Ord('A')) then
+    begin
+      FPlayer.Speed := Min(FPlayer.Speed + 15, 200);
+      FLastKey := Ord('A');
+    end
+    else if Right and (FLastKey <> Ord('D')) then
+    begin
+      FPlayer.Speed := Min(FPlayer.Speed + 15, 200);
+      FLastKey := Ord('D');
+    end;
+    
+    // Friction
+    FPlayer.Speed := FPlayer.Speed - 20 * DeltaSec;
+    if FPlayer.Speed < 0 then FPlayer.Speed := 0;
+  end;
+
+  // --- HURDLES LOGIC ---
+  if FMode = gmHurdles then
+  begin
+    // Player Jump
+    if Jump and FPlayer.OnGround and (FPlayer.Speed > 50) then
+    begin
+      FPlayer.OnGround := False;
+      FPlayer.JumpVel := -300;
+    end;
+    
+    // AI Logic
+    if FAI.OnGround then
+    begin
+      FAI.Speed := Min(FAI.Speed + 50 * DeltaSec, 150); // AI auto-accelerates
+      // AI Jump
+      for Obs in FObstacles do
+      begin
+        if (Obs - FAI.Pos.X < 40) and (FAI.Speed > 50) then
+        begin
+          FAI.OnGround := False;
+          FAI.JumpVel := -300;
+        end;
+      end;
+    end;
+    
+    // Move
+    FPlayer.Pos.X := FPlayer.Pos.X + FPlayer.Speed * DeltaSec;
+    FAI.Pos.X := FAI.Pos.X + FAI.Speed * DeltaSec;
+    
+    // Gravity
+    if not FPlayer.OnGround then
+    begin
+      FPlayer.JumpVel := FPlayer.JumpVel + 800 * DeltaSec;
+      FPlayer.Pos.Y := FPlayer.Pos.Y + FPlayer.JumpVel * DeltaSec;
+      if FPlayer.Pos.Y >= 300 then
+      begin
+        FPlayer.Pos.Y := 300;
+        FPlayer.OnGround := True;
+        FPlayer.JumpVel := 0;
+      end;
+    end;
+    if not FAI.OnGround then
+    begin
+      FAI.JumpVel := FAI.JumpVel + 800 * DeltaSec;
+      FAI.Pos.Y := FAI.Pos.Y + FAI.JumpVel * DeltaSec;
+      if FAI.Pos.Y >= 350 then
+      begin
+        FAI.Pos.Y := 350;
+        FAI.OnGround := True;
+        FAI.JumpVel := 0;
+      end;
+    end;
+    
+    // Check Obstacle Collision
+    for I := 0 to FObstacles.Count - 1 do
+    begin
+      Obs := FObstacles[I];
+      // Player hits hurdle
+      if (Abs(FPlayer.Pos.X - Obs) < 15) and FPlayer.OnGround and not FPlayer.Crashed then
+      begin
+        FPlayer.Crashed := True;
+        FPlayer.Speed := 0;
+        FMessage := 'CRASHED! Wait for end...';
+      end;
+      // AI hits hurdle
+      if (Abs(FAI.Pos.X - Obs) < 15) and FAI.OnGround and not FAI.Crashed then
+      begin
+        FAI.Crashed := True;
+        FAI.Speed := 0;
+      end;
+    end;
+    
+    // Check Win
+    if (FPlayer.Pos.X > 1600) or (FAI.Pos.X > 1600) then
+    begin
+      if FPlayer.Pos.X > FAI.Pos.X then
+        FMessage := 'YOU WIN! Next: Long Jump!'
+      else
+        FMessage := 'AI WINS! Next: Long Jump!';
+      FTimer := 3.0;
+      FMode := gmWin;
+    end;
+  end
+  // --- LONG JUMP LOGIC ---
+  else if FMode = gmLongJump then
+  {
+    // Player Jump
+    if Jump and FPlayer.OnGround and (FPlayer.Speed > 50) then
+    {
+      // Check if at board
+      if Abs(FPlayer.Pos.X - 800) < 30 then
+      begin
+        FPlayer.OnGround := False;
+        FPlayer.JumpVel := -250;
+        FPlayer.Speed := FPlayer.Speed * 1.2; // Boost
+        FMessage := 'Jumping!';
+      end;
+    end;
+    
+    // Move
+    FPlayer.Pos.X := FPlayer.Pos.X + FPlayer.Speed * DeltaSec;
+    
+    // Gravity
+    if not FPlayer.OnGround then
+    begin
+      FPlayer.JumpVel := FPlayer.JumpVel + 500 * DeltaSec;
+      FPlayer.Pos.Y := FPlayer.Pos.Y + FPlayer.JumpVel * DeltaSec;
+      if FPlayer.Pos.Y >= 300 then
+      begin
+        FPlayer.Pos.Y := 300;
+        FPlayer.OnGround := True;
+        FPlayer.JumpVel := 0;
+        FPlayer.JumpDist := FPlayer.Pos.X - 1000;
+        FMessage := 'Distance: ' + FloatToStrF(FPlayer.JumpDist/10, ffFixed, 4, 1) + ' meters!';
+        FTimer := 3.0;
+        FMode := gmWin;
+      end;
+    end;
+  }
+end;
+
+procedure TSkiaSummerGames.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF1E6B0E); // Grass Green
+  DrawTrack(ACanvas);
+  DrawAthletes(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaSummerGames.DrawTrack(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  Obs: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Track Lanes
+  Paint.Color := $FFB22222; // Red Track
+  ACanvas.DrawRect(TRectF.Create(0, 280, Width, 320), Paint);
+  ACanvas.DrawRect(TRectF.Create(0, 330, Width, 370), Paint);
+  
+  // Hurdles
+  Paint.Color := $FFFFFFFF;
+  for Obs in FObstacles do
+  begin
+    ACanvas.DrawRect(TRectF.Create(Obs-2, 260, Obs+2, 300), Paint);
+    ACanvas.DrawRect(TRectF.Create(Obs-15, 260, Obs+15, 265), Paint); // Top bar
+  end;
+  
+  // Finish Line (Hurdles)
+  if FMode = gmHurdles then
+  begin
+    Paint.Color := $FFFFFFFF;
+    for var Y := 280 to 370 step 10 do
+      ACanvas.DrawRect(TRectF.Create(1600, Y, 1605, Y+5), Paint);
+  end;
+  
+  // Long Jump Pit
+  if FMode = gmLongJump then
+  begin
+    Paint.Color := $FFD2B48C; // Sand
+    ACanvas.DrawRect(TRectF.Create(1000, 290, 2000, 320), Paint);
+    // Takeoff Board
+    Paint.Color := $FFFFFFFF;
+    ACanvas.DrawRect(TRectF.Create(798, 290, 802, 320), Paint);
+  end;
+end;
+
+procedure TSkiaSummerGames.DrawAthletes(const ACanvas: ISkCanvas);
+var
+  A: TAthlete;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for A in [FPlayer, FAI] do
+  begin
+    if A.Crashed then
+      Paint.Color := $FF888888 // Greyed out
+    else
+      Paint.Color := A.Color;
+      
+    // Body
+    ACanvas.DrawCircle(PointF(A.Pos.X, A.Pos.Y - 15), 8, Paint);
+    // Legs
+    if A.OnGround then
+    begin
+      ACanvas.DrawRect(TRectF.Create(A.Pos.X - 3, A.Pos.Y - 10, A.Pos.X + 3, A.Pos.Y), Paint);
+    end
+    else
+    begin
+      // Jumping pose
+      ACanvas.DrawRect(TRectF.Create(A.Pos.X - 8, A.Pos.Y - 8, A.Pos.X - 2, A.Pos.Y + 2), Paint); // Front leg
+      ACanvas.DrawRect(TRectF.Create(A.Pos.X + 2, A.Pos.Y - 8, A Pos.X + 8, A.Pos.Y + 2), Paint); // Back leg
+    end;
+  end;
+end;
+
+procedure TSkiaSummerGames.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Countdown
+    if FTimer > 0 and FMode <> gmWin then
+    begin
+      Paint.Color := $FFFFFFFF;
+      if FMode = gmHurdles then
+        ACanvas.DrawSimpleText('GET READY! (A/D Run, Space Jump)', 10, 30, Font, Paint)
+      else
+        ACanvas.DrawSimpleText('LONG JUMP! (A/D Run, Space at Board)', 10, 30, Font, Paint);
+    end
+    else
+    begin
+      Paint.Color := TAlphaColors.White;
+      ACanvas.DrawSimpleText(FMessage, 10, 30, Font, Paint);
+    end;
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaSummerGames.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      vkSpace: Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSummerGames.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      vkSpace: Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaSummerGames.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaSummerGames.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaSummerGames.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  {
+    FThread.Terminate;
+    Sleep(50);
+  }
+end;
+
+end.

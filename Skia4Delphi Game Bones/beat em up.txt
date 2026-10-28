@@ -1,0 +1,545 @@
+{*******************************************************************************
+  SkiaBeatEmUp (Side-Scrolling Brawler Prototype)
+********************************************************************************
+  A beat-'em-up prototype inspired by TMNT/Streets of Rage.
+  Features Z-Depth collision (movement on Y-axis), wave spawning, 
+  hit-stop, and screen shake.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaBeatEmUp;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TActionState = (asIdle, asWalk, asAttack, asHit, asDead);
+
+  TBrawler = class
+  public
+    X, Y: Single; // Y is the "Depth" (Ground position)
+    VelX, VelY: Single;
+    Dir: Integer; // 1=Right, -1=Left
+    State: TActionState;
+    StateTimer: Single;
+    HP: Integer;
+    IsPlayer: Boolean;
+    Active: Boolean;
+    
+    procedure Init(X, Y: Single; IsPlayer: Boolean);
+    function GetHitbox: TRectF;
+    function GetAttackBox: TRectF;
+  end;
+
+  TSkiaBeatEmUpGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FPlayer: TBrawler;
+    FEnemies: TObjectList<TBrawler>;
+    
+    FHitStop: Single;
+    FShakeAmount: Single;
+    FSpawnTimer: Single;
+    FScore: Integer;
+    
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure SpawnEnemy;
+    procedure ProcessCombat(Attacker, Defender: TBrawler);
+    
+    procedure DrawBackground(const ACanvas: ISkCanvas);
+    procedure DrawBrawler(const ACanvas: ISkCanvas; B: TBrawler);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TBrawler }
+procedure TBrawler.Init(X, Y: Single; IsPlayer: Boolean);
+begin
+  Self.X := X;
+  Self.Y := Y;
+  VelX := 0;
+  VelY := 0;
+  Dir := 1;
+  State := asIdle;
+  StateTimer := 0;
+  IsPlayer := IsPlayer;
+  Active := True;
+  if IsPlayer then HP := 100 else HP := 30;
+end;
+
+function TBrawler.GetHitbox: TRectF;
+begin
+  // X is center, Y is feet!
+  Result := TRectF.Create(X-15, Y-60, X+15, Y);
+end;
+
+function TBrawler.GetAttackBox: TRectF;
+begin
+  // Box in front of player
+  Result := TRectF.Create(X + (Dir * 15), Y-55, X + (Dir * 60), Y-10);
+end;
+
+{ TSkiaBeatEmUpGame }
+
+constructor TSkiaBeatEmUpGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FEnemies := TObjectList<TBrawler>.Create(True);
+  FPlayer := TBrawler.Create;
+  FPlayer.Init(200, 400, True);
+  FSpawnTimer := 2.0;
+  StartThread;
+end;
+
+destructor TSkiaBeatEmUpGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FPlayer);
+  FreeAndNil(FEnemies);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaBeatEmUpGame.SpawnEnemy;
+var
+  En: TBrawler;
+begin
+  En := TBrawler.Create;
+  En.Init(Width + 50, Random(200) + 300, False);
+  FEnemies.Add(En);
+end;
+
+procedure TSkiaBeatEmUpGame.ProcessCombat(Attacker, Defender: TBrawler);
+var
+  AtkBox, DefBox: TRectF;
+begin
+  if (Attacker.State <> asAttack) or (Defender.State = asDead) then Exit;
+
+  AtkBox := Attacker.GetAttackBox;
+  DefBox := Defender.GetHitbox;
+
+  // Check AABB Intersection AND Z-Depth (Y-Coordinates of feet must be close)
+  if AtkBox.Intersects(DefBox) and (Abs(Attacker.Y - Defender.Y) < 30) then
+  begin
+    Defender.State := asHit;
+    Defender.StateTimer := 0.3;
+    Defender.VelX := Attacker.Dir * 250;
+    Dec(Defender.HP, 20);
+    
+    FHitStop := 0.08; // Freeze frames!
+    FShakeAmount := 12;
+    
+    if Defender.HP <= 0 then
+    begin
+      Defender.State := asDead;
+      Defender.StateTimer := 2.0;
+      if not Defender.IsPlayer then Inc(FScore);
+    end;
+    
+    Attacker.State := asIdle; // Reset attacker to prevent multi-hits
+  end;
+end;
+
+procedure TSkiaBeatEmUpGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down, Punch: Boolean;
+  I: Integer;
+  En: TBrawler;
+  FloorY: Single;
+begin
+  if not FActive then Exit;
+
+  // Hitstop freezes everything
+  if FHitStop > 0 then
+  begin
+    FHitStop := FHitStop - DeltaSec;
+    FShakeAmount := FShakeAmount * 0.9;
+    Exit;
+  end;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    Punch := (Byte(vkSpace) in FKeys) or (Byte(Ord('J')) in FKeys);
+    if Punch then
+    begin
+      Exclude(FKeys, vkSpace); Exclude(FKeys, Byte(Ord('J')));
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  // --- PLAYER LOGIC ---
+  if FPlayer.State <> asHit then
+  begin
+    if Punch and (FPlayer.State in [asIdle, asWalk]) then
+    begin
+      FPlayer.State := asAttack;
+      FPlayer.StateTimer := 0.25;
+      FPlayer.VelX := 0;
+    end
+    else if FPlayer.State = asAttack then
+    begin
+      // Wait for attack to finish
+    end
+    else
+    begin
+      if Left then begin FPlayer.VelX := -200; FPlayer.Dir := -1; FPlayer.State := asWalk; end
+      else if Right then begin FPlayer.VelX := 200; FPlayer.Dir := 1; FPlayer.State := asWalk; end
+      else begin FPlayer.VelX := 0; FPlayer.State := asIdle; end;
+      
+      if Up then FPlayer.VelY := -150
+      else if Down then FPlayer.VelY := 150
+      else FPlayer.VelY := 0;
+    end;
+  end;
+
+  // Player Physics
+  FPlayer.X := FPlayer.X + FPlayer.VelX * DeltaSec;
+  FPlayer.Y := FPlayer.Y + FPlayer.VelY * DeltaSec;
+  FPlayer.Y := EnsureRange(FPlayer.Y, 300, 500); // Z-Depth Limits (Street size)
+  FPlayer.X := EnsureRange(FPlayer.X, 20, Width - 20);
+
+  if FPlayer.StateTimer > 0 then
+  begin
+    FPlayer.StateTimer := FPlayer.StateTimer - DeltaSec;
+    if FPlayer.StateTimer <= 0 then
+      if FPlayer.State in [asAttack, asHit] then FPlayer.State := asIdle;
+  end;
+
+  // --- ENEMY LOGIC & PHYSICS ---
+  for I := FEnemies.Count - 1 downto 0 do
+  begin
+    En := FEnemies[I];
+    
+    if En.State = asDead then
+    begin
+      En.StateTimer := En.StateTimer - DeltaSec;
+      if En.StateTimer <= 0 then FEnemies.Delete(I);
+      Continue;
+    end;
+    
+    if En.State = asHit then
+    begin
+      En.StateTimer := En.StateTimer - DeltaSec;
+      En.X := En.X + En.VelX * DeltaSec;
+      En.VelX := En.VelX * 0.9;
+      if En.StateTimer <= 0 then En.State := asIdle;
+    end
+    else
+    begin
+      // AI: Move towards player
+      if En.X > FPlayer.X then En.Dir := -1 else En.Dir := 1;
+      
+      if Abs(En.X - FPlayer.X) > 50 then
+        En.VelX := En.Dir * 100
+      else
+        En.VelX := 0;
+        
+      // Z-Depth AI: Align with player Y
+      if Abs(En.Y - FPlayer.Y) > 10 then
+      begin
+        if En.Y > FPlayer.Y then En.VelY := -80 else En.VelY := 80;
+      end
+      else
+        En.VelY := 0;
+        
+      // AI Attack
+      if (Abs(En.X - FPlayer.X) < 60) and (Abs(En.Y - FPlayer.Y) < 30) and (En.State = asIdle) then
+      begin
+        if Random(100) < 5 then
+        begin
+          En.State := asAttack;
+          En.StateTimer := 0.3;
+        end;
+      end;
+      
+      En.X := En.X + En.VelX * DeltaSec;
+      En.Y := En.Y + En.VelY * DeltaSec;
+      
+      if En.StateTimer > 0 then
+      begin
+        En.StateTimer := En.StateTimer - DeltaSec;
+        if En.StateTimer <= 0 then
+          if En.State in [asAttack, asHit] then En.State := asIdle;
+      end;
+    end;
+    
+    // Combat Checks
+    ProcessCombat(FPlayer, En);
+    ProcessCombat(En, FPlayer);
+  end;
+
+  // Spawning
+  FSpawnTimer := FSpawnTimer - DeltaSec;
+  if FSpawnTimer <= 0 then
+  begin
+    SpawnEnemy;
+    FSpawnTimer := 3.0;
+  end;
+
+  FShakeAmount := FShakeAmount * 0.9;
+end;
+
+procedure TSkiaBeatEmUpGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  RenderList: TList<TBrawler>;
+  I: Integer;
+  ShakeX, ShakeY: Single;
+begin
+  ACanvas.Clear($FF1a1a1a);
+  
+  ShakeX := (Random - 0.5) * FShakeAmount;
+  ShakeY := (Random - 0.5) * FShakeAmount;
+  ACanvas.Save;
+  ACanvas.Translate(ShakeX, ShakeY);
+
+  DrawBackground(ACanvas);
+
+  // Z-Sorting (Painter's Algorithm)
+  RenderList := TList<TBrawler>.Create;
+  try
+    RenderList.Add(FPlayer);
+    for I := 0 to FEnemies.Count - 1 do
+      RenderList.Add(FEnemies[I]);
+      
+    RenderList.Sort(
+      TComparer<TBrawler>.Construct(
+        function(const A, B: TBrawler): Integer
+        begin
+          Result := CompareValue(A.Y, B.Y); // Sort by Y-Feet position!
+        end)
+    );
+    
+    for I := 0 to RenderList.Count - 1 do
+      DrawBrawler(ACanvas, RenderList[I]);
+  finally
+    RenderList.Free;
+  end;
+
+  ACanvas.Restore;
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaBeatEmUpGame.DrawBackground(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Sky/Wall
+  Paint.Color := $FF222244;
+  ACanvas.DrawRect(TRectF.Create(0, 0, Width, 300), Paint);
+  
+  // Street
+  Paint.Color := $FF333333;
+  ACanvas.DrawRect(TRectF.Create(0, 300, Width, Height), Paint);
+  
+  // Street Lines (Top down perspective)
+  Paint.Color := $FF444444;
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 2;
+  for var I := 0 to 5 do
+  begin
+    var Y := 320 + (I * I * 12);
+    ACanvas.DrawLine(PointF(0, Y), PointF(Width, Y), Paint);
+  end;
+  Paint.Style := TSkPaintStyle.Fill;
+end;
+
+procedure TSkiaBeatEmUpGame.DrawBrawler(const ACanvas: ISkCanvas; B: TBrawler);
+var
+  Paint: ISkPaint;
+  BodyRect: TRectF;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(B.X-20, B.Y-5, B.X+20, B.Y+5), Paint);
+  Paint.Alpha := 255;
+  
+  // Body Color
+  if B.IsPlayer then Paint.Color := $FF00AAFF // Blue
+  else Paint.Color := $FFAA0000; // Red
+  
+  if B.State = asHit then Paint.Color := $FFFFFF00; // Flash Yellow
+  if B.State = asDead then Paint.Color := $FF555555; // Grey
+  
+  if B.State = asDead then
+  begin
+    // Lying down
+    ACanvas.DrawRoundRect(TRectF.Create(B.X-25, B.Y-10, B.X+25, B.Y+10), 5, 5, Paint);
+  end
+  else
+  begin
+    // Legs
+    ACanvas.DrawRect(TRectF.Create(B.X-10, B.Y-20, B.X-3, B.Y), Paint);
+    ACanvas.DrawRect(TRectF.Create(B.X+3, B.Y-20, B.X+10, B.Y), Paint);
+    
+    // Body
+    ACanvas.DrawRoundRect(TRectF.Create(B.X-15, B.Y-50, B.X+15, B.Y-20), 5, 5, Paint);
+    
+    // Head
+    ACanvas.DrawCircle(PointF(B.X, B.Y-60), 10, Paint);
+    
+    // Arm / Attack
+    if B.State = asAttack then
+    begin
+      ACanvas.DrawRect(TRectF.Create(B.X + (B.Dir*10), B.Y-45, B.X + (B.Dir*40), B.Y-35), Paint);
+    end
+    else
+    begin
+      ACanvas.DrawRect(TRectF.Create(B.X + (B.Dir*10), B.Y-45, B.X + (B.Dir*20), B.Y-30), Paint);
+    end;
+  end;
+end;
+
+procedure TSkiaBeatEmUpGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Health Bar
+    Paint.Color := $FF000000;
+    ACanvas.DrawRect(TRectF.Create(20, 20, 220, 40), Paint);
+    Paint.Color := $FF00FF00;
+    ACanvas.DrawRect(TRectF.Create(22, 22, 22 + (FPlayer.HP * 1.96), 38), Paint);
+    
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('HP: ' + IntToStr(FPlayer.HP), 30, 35, Font, Paint);
+    ACanvas.DrawSimpleText('Score: ' + IntToStr(FScore), Width - 150, 35, Font, Paint);
+    ACanvas.DrawSimpleText('WASD: Move | Space/J: Punch', 20, 60, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaBeatEmUpGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaBeatEmUpGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaBeatEmUpGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaBeatEmUpGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaBeatEmUpGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

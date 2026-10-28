@@ -1,0 +1,490 @@
+{*******************************************************************************
+  SkiaIsoSports (Isometric Sports Prototype)
+********************************************************************************
+  An isometric sports prototype inspired by NBA Jam / Arch Rivals.
+  Features iso-grid movement, Z-depth sorting (painter's algorithm), jumping 
+  physics, and a dynamic bouncing ball.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaIsoSports;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 1000;
+
+type
+  TEntity = class
+  public
+    X, Y, Z: Single; // Z is Height off the ground
+    VelX, VelY, VelZ: Single;
+    IsPlayer: Boolean;
+    HasBall: Boolean;
+    IsAI: Boolean;
+    JumpTimer: Single;
+  end;
+
+  TSkiaIsoSports = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FEntities: TObjectList<TEntity>;
+    FPlayer: TEntity;
+    FAI: TEntity;
+    FBall: TEntity;
+    
+    procedure InitGame;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawIsoBox(const ACanvas: ISkCanvas; CX, CY, W, D, H: Single; TopColor, LeftColor, RightColor: TAlphaColor);
+    procedure DrawCourt(const ACanvas: ISkCanvas);
+    procedure DrawEntities(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+const
+  TILE_W = 40;
+  TILE_H = 20;
+
+{ TSkiaIsoSports }
+
+constructor TSkiaIsoSports.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FEntities := TObjectList<TEntity>.Create(True);
+  InitGame;
+  StartThread;
+end;
+
+destructor TSkiaIsoSports.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FEntities);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaIsoSports.InitGame;
+begin
+  FEntities.Clear;
+  
+  FPlayer := TEntity.Create;
+  FPlayer.X := 100; FPlayer.Y := 200; FPlayer.Z := 0;
+  FPlayer.IsPlayer := True; FPlayer.HasBall := True; FPlayer.IsAI := False;
+  FEntities.Add(FPlayer);
+  
+  FAI := TEntity.Create;
+  FAI.X := 300; FAI.Y := 300; FAI.Z := 0;
+  FAI.IsPlayer := False; FAI.HasBall := False; FAI.IsAI := True;
+  FEntities.Add(FAI);
+  
+  FBall := TEntity.Create;
+  FBall.X := 100; FBall.Y := 200; FBall.Z := 30;
+  FBall.VelZ := 0;
+  FEntities.Add(FBall);
+end;
+
+procedure TSkiaIsoSports.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down, Jump: Boolean;
+  Spd: Single;
+  I: Integer;
+  E: TEntity;
+  Dist: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    Jump := (Byte(vkSpace) in FKeys) or (Byte(Ord('J')) in FKeys);
+    if Jump then
+    begin
+      Exclude(FKeys, vkSpace); Exclude(FKeys, Byte(Ord('J')));
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  Spd := 150 * DeltaSec;
+
+  // --- PLAYER MOVEMENT ---
+  if Left then FPlayer.X := FPlayer.X - Spd;
+  if Right then FPlayer.X := FPlayer.X + Spd;
+  if Up then FPlayer.Y := FPlayer.Y - Spd;
+  if Down then FPlayer.Y := FPlayer.Y + Spd;
+  
+  FPlayer.X := EnsureRange(FPlayer.X, 50, Width - 50);
+  FPlayer.Y := EnsureRange(FPlayer.Y, 50, Height - 50);
+
+  // Jump
+  if Jump and (FPlayer.Z = 0) then
+    FPlayer.VelZ := 500;
+    
+  // Player Physics
+  FPlayer.VelZ := FPlayer.VelZ - GRAVITY * DeltaSec;
+  FPlayer.Z := FPlayer.Z + FPlayer.VelZ * DeltaSec;
+  if FPlayer.Z < 0 then
+  begin
+    FPlayer.Z := 0;
+    FPlayer.VelZ := 0;
+  end;
+
+  // --- AI MOVEMENT (Follow Player) ---
+  if FAI.X < FPlayer.X then FAI.X := FAI.X + Spd * 0.8;
+  if FAI.X > FPlayer.X then FAI.X := FAI.X - Spd * 0.8;
+  if FAI.Y < FPlayer.Y then FAI.Y := FAI.Y + Spd * 0.8;
+  if FAI.Y > FPlayer.Y then FAI.Y := FAI.Y - Spd * 0.8;
+
+  // --- BALL PHYSICS ---
+  if FPlayer.HasBall then
+  begin
+    FBall.X := FPlayer.X;
+    FBall.Y := FPlayer.Y;
+    FBall.Z := FPlayer.Z + 30;
+    FBall.VelZ := 0;
+  end
+  else if FAI.HasBall then
+  begin
+    FBall.X := FAI.X;
+    FBall.Y := FAI.Y;
+    FBall.Z := FAI.Z + 30;
+    FBall.VelZ := 0;
+  end
+  else
+  begin
+    // Loose ball: bounces on floor
+    FBall.VelZ := FBall.VelZ - GRAVITY * DeltaSec;
+    FBall.Z := FBall.Z + FBall.VelZ * DeltaSec;
+    if FBall.Z < 10 then
+    begin
+      FBall.Z := 10;
+      FBall.VelZ := -FBall.VelZ * 0.6; // Bounce damping
+      if Abs(FBall.VelZ) < 50 then FBall.VelZ := 0; // Stop bouncing
+    end;
+  end;
+
+  // --- STEAL / REBOUND LOGIC ---
+  for I := 0 to FEntities.Count - 1 do
+  begin
+    E := FEntities[I];
+    if E.IsPlayer or E.IsAI then
+    begin
+      Dist := Hypot(E.X - FBall.X, E.Y - FBall.Y);
+      // If close to loose ball and jumping (Rebound) or ball is low
+      if (Dist < 30) and (FBall.Z < E.Z + 50) and not FPlayer.HasBall and not FAI.HasBall then
+      begin
+        if E.IsPlayer then FPlayer.HasBall := True
+        else FAI.HasBall := True;
+        FBall.VelZ := 0;
+      end;
+    end;
+  end;
+end;
+
+procedure TSkiaIsoSports.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF112233);
+  DrawCourt(ACanvas);
+  DrawEntities(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaIsoSports.DrawIsoBox(const ACanvas: ISkCanvas; CX, CY, W, D, H: Single; TopColor, LeftColor, RightColor: TAlphaColor);
+var
+  P1, P2, P3, P4: TPointF;
+  PB: ISkPathBuilder;
+  Paint: ISkPaint;
+begin
+  P1 := PointF(CX, CY - D * (TILE_H / 2)); // Top
+  P2 := PointF(CX + W * (TILE_W / 2), CY); // Right
+  P3 := PointF(CX, CY + D * (TILE_H / 2)); // Bottom
+  P4 := PointF(CX - W * (TILE_W / 2), CY); // Left
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+
+  // Right Face
+  Paint.Color := RightColor;
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(P2.X, P2.Y);
+  PB.LineTo(P3.X, P3.Y);
+  PB.LineTo(P3.X, P3.Y - H);
+  PB.LineTo(P2.X, P2.Y - H);
+  PB.Close;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+
+  // Left Face
+  Paint.Color := LeftColor;
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(P4.X, P4.Y);
+  PB.LineTo(P3.X, P3.Y);
+  PB.LineTo(P3.X, P3.Y - H);
+  PB.LineTo(P4.X, P4.Y - H);
+  PB.Close;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+
+  // Top Face
+  Paint.Color := TopColor;
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(P1.X, P1.Y - H);
+  PB.LineTo(P2.X, P2.Y - H);
+  PB.LineTo(P3.X, P3.Y - H);
+  PB.LineTo(P4.X, P4.Y - H);
+  PB.Close;
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+end;
+
+procedure TSkiaIsoSports.DrawCourt(const ACanvas: ISkCanvas);
+var
+  X, Y: Integer;
+  CX, CY: Single;
+  OffsetX, OffsetY: Single;
+begin
+  OffsetX := Width / 2;
+  OffsetY := 100;
+  
+  // Draw Iso Grid (Court)
+  for Y := 0 to 14 do
+  begin
+    for X := 0 to 20 do
+    begin
+      CX := (X - Y) * (TILE_W / 2) + OffsetX;
+      CY := (X + Y) * (TILE_H / 2) + OffsetY;
+      
+      if (X = 10) and (Y >= 5) and (Y <= 9) then
+        DrawIsoBox(ACanvas, CX, CY, 1, 1, 0, $FFA52A2A, $FF8B4513, $FF7A3B10) // Center Line (Red)
+      else
+        DrawIsoBox(ACanvas, CX, CY, 1, 1, 0, $FF228B22, $FF1E7B1E, $FF176B17); // Grass/Court
+    end;
+  end;
+end;
+
+procedure TSkiaIsoSports.DrawEntities(const ACanvas: ISkCanvas);
+var
+  RenderList: TList<TEntity>;
+  E: TEntity;
+  CX, CY: Single;
+  Paint, Glow: ISkPaint;
+  I: Integer;
+begin
+  RenderList := TList<TEntity>.Create;
+  try
+    for I := 0 to FEntities.Count - 1 do
+      RenderList.Add(FEntities[I]);
+      
+    // Z-Sort: Sort by Y (Depth) and Z (Jump Height)
+    RenderList.Sort(
+      TComparer<TEntity>.Construct(
+        function(const A, B: TEntity): Integer
+        var
+          SumA, SumB: Single;
+        begin
+          SumA := A.Y + A.Z * 10; // Z has high priority so jumpers are drawn over others
+          SumB := B.Y + B.Z * 10;
+          Result := CompareValue(SumA, SumB);
+        end)
+    );
+    
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    for I := 0 to RenderList.Count - 1 do
+    begin
+      E := RenderList[I];
+      // Convert World X/Y to Iso Screen X/Y
+      CX := (E.X - E.Y) * (TILE_W / 40) + Width / 2;
+      CY := (E.X + E.Y) * (TILE_H / 40) + 100 - E.Z; // Subtract Z for height
+      
+      // Shadows (Projected at Z=0)
+      Paint.Color := $FF000000;
+      Paint.Alpha := 80;
+      ACanvas.DrawOval(TRectF.Create(CX-10, (E.X + E.Y) * (TILE_H / 40) + 100 + 5, CX+10, (E.X + E.Y) * (TILE_H / 40) + 100 + 10), Paint);
+      Paint.Alpha := 255;
+      
+      if E = FBall then
+      begin
+        // Draw Ball
+        Paint.Color := $FFFF8C00; // Basketball Orange
+        ACanvas.DrawCircle(PointF(CX, CY), 8, Paint);
+        Paint.Color := $FF000000;
+        ACanvas.DrawLine(PointF(CX-8, CY), PointF(CX+8, CY), Paint);
+        ACanvas.DrawLine(PointF(CX, CY-8), PointF(CX, CY+8), Paint);
+      end
+      else
+      begin
+        // Draw Player (Cylinder)
+        Glow := TSkPaint.Create(Paint);
+        Glow.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 4.0);
+        
+        if E.IsPlayer then
+        begin
+          if E.HasBall then Glow.Color := $FFFFFF00 else Glow.Color := $FF00FFFF;
+          Paint.Color := $FF0066FF;
+        end
+        else
+        begin
+          if E.HasBall then Glow.Color := $FFFFFF00 else Glow.Color := $FFFF0000;
+          Paint.Color := $FFAA0000;
+        end;
+        
+        // Base
+        ACanvas.DrawCircle(PointF(CX, CY + 10), 10, Paint);
+        // Body
+        ACanvas.DrawRect(TRectF.Create(CX-8, CY-15, CX+8, CY+10), Paint);
+        // Head
+        ACanvas.DrawCircle(PointF(CX, CY-20), 7, Paint);
+        
+        // Glow if has ball
+        if E.HasBall then
+        begin
+          Paint.Style := TSkPaintStyle.Stroke;
+          Paint.StrokeWidth := 2;
+          Paint.Color := Glow.Color;
+          ACanvas.DrawCircle(PointF(CX, CY-5), 18, Paint);
+          Paint.Style := TSkPaintStyle.Fill;
+        end;
+      end;
+    end;
+  finally
+    RenderList.Free;
+  end;
+end;
+
+procedure TSkiaIsoSports.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD: Move | Space: Jump | Steal ball by jumping into it!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaIsoSports.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaIsoSports.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaIsoSports.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaIsoSports.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end});
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaIsoSports.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

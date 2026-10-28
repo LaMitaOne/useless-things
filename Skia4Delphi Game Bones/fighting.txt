@@ -1,0 +1,555 @@
+{*******************************************************************************
+  SkiaFighter (2D Fighting Game Prototype)
+********************************************************************************
+  A 2-player fighting game prototype featuring a state machine (Idle, Walk, 
+  Attack, Hit), hitboxes, hitstop (freeze frames on impact), and screen shake.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaFighter;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TFighterState = (fsIdle, fsWalk, fsJump, fsCrouch, fsAttack, fsHit, fsKo);
+
+  TFighter = class
+  public
+    X, Y: Single;
+    VelX, VelY: Single;
+    Dir: Integer; // 1 = Right, -1 = Left
+    State: TFighterState;
+    StateTimer: Single;
+    HP: Integer;
+    IsPlayer1: Boolean;
+    
+    procedure Init(X: Single; IsP1: Boolean);
+    function GetHitbox: TRectF;
+    function GetAttackBox: TRectF;
+  end;
+
+  TSkiaFighterGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FPlayer1: TFighter;
+    FPlayer2: TFighter;
+    
+    FHitStop: Single;
+    FShakeAmount: Single;
+    
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawFighter(const ACanvas: ISkCanvas; F: TFighter);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+    procedure ProcessInput(F: TFighter; IsP1: Boolean);
+    procedure CheckCombat;
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TFighter }
+procedure TFighter.Init(X: Single; IsP1: Boolean);
+begin
+  Self.X := X;
+  Y := 400;
+  VelX := 0;
+  VelY := 0;
+  State := fsIdle;
+  StateTimer := 0;
+  HP := 100;
+  IsPlayer1 := IsP1;
+  Dir := IfThen(IsP1, 1, -1);
+end;
+
+function TFighter.GetHitbox: TRectF;
+begin
+  if State = fsCrouch then
+    Result := TRectF.Create(X-20, Y-40, X+20, Y+50)
+  else
+    Result := TRectF.Create(X-20, Y-70, X+20, Y+50);
+end;
+
+function TFighter.GetAttackBox: TRectF;
+begin
+  // Box is in front of fighter
+  Result := TRectF.Create(X + (Dir * 20), Y-60, X + (Dir * 70), Y-20);
+end;
+
+{ TSkiaFighterGame }
+
+constructor TSkiaFighterGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FPlayer1 := TFighter.Create;
+  FPlayer2 := TFighter.Create;
+  FPlayer1.Init(300, True);
+  FPlayer2.Init(700, False);
+  StartThread;
+end;
+
+destructor TSkiaFighterGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FPlayer1);
+  FreeAndNil(FPlayer2);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaFighterGame.ProcessInput(F: TFighter; IsP1: Boolean);
+var
+  Left, Right, Up, Down, Punch: Boolean;
+begin
+  FLock.Acquire;
+  try
+    if IsP1 then
+    begin
+      Left := Byte(Ord('A')) in FKeys;
+      Right := Byte(Ord('D')) in FKeys;
+      Up := Byte(Ord('W')) in FKeys;
+      Down := Byte(Ord('S')) in FKeys;
+      Punch := Byte(Ord('F')) in FKeys;
+      // Consume Punch
+      if Punch then Exclude(FKeys, Byte(Ord('F')));
+    end
+    else
+    begin
+      Left := vkLeft in FKeys;
+      Right := vkRight in FKeys;
+      Up := vkUp in FKeys;
+      Down := vkDown in FKeys;
+      Punch := Byte(Ord('K')) in FKeys;
+      if Punch then Exclude(FKeys, Byte(Ord('K')));
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  // Can't act if in Hit/KO state
+  if F.State in [fsHit, fsKo] then Exit;
+
+  // Jumping
+  if (F.State = fsJump) then
+  begin
+    if Left then F.VelX := -150;
+    if Right then F.VelX := 150;
+    Exit; // Can't attack or crouch while jumping in this simple prototype
+  end;
+
+  // Start Attack
+  if Punch and (F.State in [fsIdle, fsWalk]) then
+  begin
+    F.State := fsAttack;
+    F.StateTimer := 0.3; // 300ms attack
+    F.VelX := 0;
+    Exit;
+  end;
+
+  // Jump
+  if Up and (F.State in [fsIdle, fsWalk]) then
+  begin
+    F.State := fsJump;
+    F.VelY := -600;
+    F.StateTimer := 0;
+    Exit;
+  end;
+
+  if F.State = fsAttack then Exit;
+
+  // Crouch
+  if Down then
+  begin
+    F.State := fsCrouch;
+    F.VelX := 0;
+  end
+  else
+  begin
+    // Walk or Idle
+    if Left then
+    begin
+      F.State := fsWalk;
+      F.VelX := -200;
+    end
+    else if Right then
+    begin
+      F.State := fsWalk;
+      F.VelX := 200;
+    end
+    else
+    begin
+      F.State := fsIdle;
+      F.VelX := 0;
+    end;
+  end;
+end;
+
+procedure TSkiaFighterGame.CheckCombat;
+var
+  AtkBox, DefBox: TRectF;
+  Atk, Def: TFighter;
+begin
+  if (FPlayer1.State = fsAttack) and (FPlayer2.State <> fsKo) then
+  begin
+    Atk := FPlayer1; Def := FPlayer2;
+    AtkBox := Atk.GetAttackBox;
+    DefBox := Def.GetHitbox;
+    if AtkBox.Intersects(DefBox) then
+    begin
+      Def.State := fsHit;
+      Def.StateTimer := 0.3;
+      Def.VelX := Atk.Dir * 300;
+      Dec(Def.HP, 10);
+      FHitStop := 0.08; // Freeze game for 80ms!
+      FShakeAmount := 15;
+      Atk.State := fsIdle; // Reset attacker
+    end;
+  end;
+
+  if (FPlayer2.State = fsAttack) and (FPlayer1.State <> fsKo) then
+  begin
+    Atk := FPlayer2; Def := FPlayer1;
+    AtkBox := Atk.GetAttackBox;
+    DefBox := Def.GetHitbox;
+    if AtkBox.Intersects(DefBox) then
+    begin
+      Def.State := fsHit;
+      Def.StateTimer := 0.3;
+      Def.VelX := Atk.Dir * 300;
+      Dec(Def.HP, 10);
+      FHitStop := 0.08;
+      FShakeAmount := 15;
+      Atk.State := fsIdle;
+    end;
+  end;
+end;
+
+procedure TSkiaFighterGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  FloorY: Single;
+begin
+  if not FActive then Exit;
+
+  // Hitstop freezes the entire game
+  if FHitStop > 0 then
+  begin
+    FHitStop := FHitStop - DeltaSec;
+    FShakeAmount := FShakeAmount * 0.9;
+    Exit;
+  end;
+
+  ProcessInput(FPlayer1, True);
+  ProcessInput(FPlayer2, False);
+
+  // Auto-Face each other
+  if not (FPlayer1.State in [fsHit, fsKo, fsJump]) then
+    FPlayer1.Dir := IfThen(FPlayer1.X < FPlayer2.X, 1, -1);
+  if not (FPlayer2.State in [fsHit, fsKo, fsJump]) then
+    FPlayer2.Dir := IfThen(FPlayer2.X < FPlayer1.X, 1, -1);
+
+  // Physics
+  FloorY := 450;
+  
+  // P1
+  FPlayer1.VelY := FPlayer1.VelY + 1500 * DeltaSec;
+  FPlayer1.X := FPlayer1.X + FPlayer1.VelX * DeltaSec;
+  FPlayer1.Y := FPlayer1.Y + FPlayer1.VelY * DeltaSec;
+  if FPlayer1.Y > FloorY then
+  begin
+    FPlayer1.Y := FloorY;
+    FPlayer1.VelY := 0;
+    if FPlayer1.State = fsJump then FPlayer1.State := fsIdle;
+  end;
+  if FPlayer1.StateTimer > 0 then
+  begin
+    FPlayer1.StateTimer := FPlayer1.StateTimer - DeltaSec;
+    if FPlayer1.StateTimer <= 0 then
+    begin
+      if FPlayer1.State = fsAttack then FPlayer1.State := fsIdle;
+      if FPlayer1.State = fsHit then FPlayer1.State := fsIdle;
+    end;
+  end;
+  if FPlayer1.HP <= 0 then FPlayer1.State := fsKo;
+
+  // P2
+  FPlayer2.VelY := FPlayer2.VelY + 1500 * DeltaSec;
+  FPlayer2.X := FPlayer2.X + FPlayer2.VelX * DeltaSec;
+  FPlayer2.Y := FPlayer2.Y + FPlayer2.VelY * DeltaSec;
+  if FPlayer2.Y > FloorY then
+  begin
+    FPlayer2.Y := FloorY;
+    FPlayer2.VelY := 0;
+    if FPlayer2.State = fsJump then FPlayer2.State := fsIdle;
+  end;
+  if FPlayer2.StateTimer > 0 then
+  begin
+    FPlayer2.StateTimer := FPlayer2.StateTimer - DeltaSec;
+    if FPlayer2.StateTimer <= 0 then
+    begin
+      if FPlayer2.State = fsAttack then FPlayer2.State := fsIdle;
+      if FPlayer2.State = fsHit then FPlayer2.State := fsIdle;
+    end;
+  end;
+  if FPlayer2.HP <= 0 then FPlayer2.State := fsKo;
+
+  // Body Collision (Push apart)
+  if Abs(FPlayer1.X - FPlayer2.X) < 40 then
+  begin
+    if FPlayer1.X < FPlayer2.X then
+    begin
+      FPlayer1.X := FPlayer1.X - 50 * DeltaSec;
+      FPlayer2.X := FPlayer2.X + 50 * DeltaSec;
+    end
+    else
+    begin
+      FPlayer1.X := FPlayer1.X + 50 * DeltaSec;
+      FPlayer2.X := FPlayer2.X - 50 * DeltaSec;
+    end;
+  end;
+
+  CheckCombat;
+  FShakeAmount := FShakeAmount * 0.9;
+end;
+
+procedure TSkiaFighterGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  ShakeX, ShakeY: Single;
+begin
+  ACanvas.Clear($FF222233);
+  
+  // Screen Shake
+  ShakeX := (Random - 0.5) * FShakeAmount;
+  ShakeY := (Random - 0.5) * FShakeAmount;
+  ACanvas.Save;
+  ACanvas.Translate(ShakeX, ShakeY);
+
+  // Floor
+  var Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.Color := $FF111122;
+  ACanvas.DrawRect(TRectF.Create(0, 450, Width, Height), Paint);
+
+  DrawFighter(ACanvas, FPlayer1);
+  DrawFighter(ACanvas, FPlayer2);
+
+  ACanvas.Restore;
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaFighterGame.DrawFighter(const ACanvas: ISkCanvas; F: TFighter);
+var
+  Paint, Glow: ISkPaint;
+  BodyRect: TRectF;
+  ArmOffset: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(F.X-25, 440, F.X+25, 460), Paint);
+  Paint.Alpha := 255;
+  
+  if F.IsPlayer1 then
+    Paint.Color := $FF0066FF
+  else
+    Paint.Color := $FFFF0000;
+
+  if F.State = fsHit then
+    Paint.Color := $FFFFFF00; // Flash yellow when hit
+  if F.State = fsKo then
+    Paint.Color := $FF555555; // Greyed out
+
+  if F.State = fsCrouch then
+  begin
+    ACanvas.DrawRoundRect(TRectF.Create(F.X-20, F.Y-30, F.X+20, F.Y+50), 5, 5, Paint);
+  end
+  else
+  begin
+    // Legs
+    ACanvas.DrawRect(TRectF.Create(F.X-15, F.Y, F.X-5, F.Y+40), Paint);
+    ACanvas.DrawRect(TRectF.Create(F.X+5, F.Y, F.X+15, F.Y+40), Paint);
+    // Body
+    ACanvas.DrawRoundRect(TRectF.Create(F.X-20, F.Y-40, F.X+20, F.Y), 5, 5, Paint);
+    // Head
+    ACanvas.DrawCircle(PointF(F.X, F.Y-50), 12, Paint);
+    
+    // Arm (Attack animation)
+    if F.State = fsAttack then
+    begin
+      // Arm extends in Dir
+      ACanvas.DrawRect(TRectF.Create(F.X + (F.Dir*15), F.Y-30, F.X + (F.Dir*50), F.Y-20), Paint);
+    end
+    else
+    begin
+      // Idle Arm
+      ACanvas.DrawRect(TRectF.Create(F.X + (F.Dir*15), F.Y-30, F.X + (F.Dir*25), F.Y-10), Paint);
+    end;
+  end;
+end;
+
+procedure TSkiaFighterGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Health Bars
+    Paint.Color := $FF000000;
+    ACanvas.DrawRect(TRectF.Create(20, 20, 320, 50), Paint);
+    ACanvas.DrawRect(TRectF.Create(Width-340, 20, Width-20, 50), Paint);
+    
+    Paint.Color := $FF00FF00;
+    ACanvas.DrawRect(TRectF.Create(25, 25, 25 + (FPlayer1.HP * 2.9), 45), Paint);
+    ACanvas.DrawRect(TRectF.Create(Width-25 - (FPlayer2.HP * 2.9), 25, Width-25, 45), Paint);
+
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('P1: WASD+F', 20, 70, Font, Paint);
+    ACanvas.DrawSimpleText('P2: Arrows+K', Width-120, 70, Font, Paint);
+
+    if (FPlayer1.State = fsKo) or (FPlayer2.State = fsKo) then
+    begin
+      Paint.Color := $FFFF0000;
+      Paint.Alpha := 200;
+      ACanvas.DrawRect(TRectF.Create(0, 0, Width, Height), Paint);
+      Paint.Alpha := 255;
+      Paint.Color := TAlphaColors.White;
+      if FPlayer1.State = fsKo then
+        ACanvas.DrawSimpleText('PLAYER 2 WINS! (K.O.)', Width/2 - 100, Height/2, Font, Paint)
+      else
+        ACanvas.DrawSimpleText('PLAYER 1 WINS! (K.O.)', Width/2 - 100, Height/2, Font, Paint);
+    end;
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaFighterGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft: Include(FKeys, vkLeft);
+      vkRight: Include(FKeys, vkRight);
+      vkUp: Include(FKeys, vkUp);
+      vkDown: Include(FKeys, vkDown);
+      Byte(Ord('A')): Include(FKeys, Byte(Ord('A')));
+      Byte(Ord('D')): Include(FKeys, Byte(Ord('D')));
+      Byte(Ord('W')): Include(FKeys, Byte(Ord('W')));
+      Byte(Ord('S')): Include(FKeys, Byte(Ord('S')));
+      Byte(Ord('F')): Include(FKeys, Byte(Ord('F')));
+      Byte(Ord('K')): Include(FKeys, Byte(Ord('K')));
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaFighterGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft: Exclude(FKeys, vkLeft);
+      vkRight: Exclude(FKeys, vkRight);
+      vkUp: Exclude(FKeys, vkUp);
+      vkDown: Exclude(FKeys, vkDown);
+      Byte(Ord('A')): Exclude(FKeys, Byte(Ord('A')));
+      Byte(Ord('D')): Exclude(FKeys, Byte(Ord('D')));
+      Byte(Ord('W')): Exclude(FKeys, Byte(Ord('W')));
+      Byte(Ord('S')): Exclude(FKeys, Byte(Ord('S')));
+      Byte(Ord('F')): Exclude(FKeys, Byte(Ord('F')));
+      Byte(Ord('K')): Exclude(FKeys, Byte(Ord('K')));
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaFighterGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaFighterGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaFighterGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

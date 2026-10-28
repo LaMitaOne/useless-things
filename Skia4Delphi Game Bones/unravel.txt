@@ -1,0 +1,409 @@
+{*******************************************************************************
+  SkiaUnravel (Yarn Physics Prototype)
+********************************************************************************
+  A side-scrolling prototype featuring rope physics (distance constraints).
+  The yarn ball is attached to an anchor point. If it moves too far, the rope
+  pulls it back, allowing for pendulum and wall-climbing mechanics.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaUnravel;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  GRAVITY = 1500;
+  MAX_ROPE_LENGTH = 200;
+
+type
+  TSkiaUnravelGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FYarnX, FYarnY: Single;
+    FYarnVelX, FYarnVelY: Single;
+    FOnGround: Boolean;
+    
+    FAnchorX, FAnchorY: Single;
+    FRopePoints: TList<TPointF>; // For smooth rendering of the rope
+    
+    procedure InitLevel;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure ApplyRopeConstraint;
+    procedure DrawBackground(const ACanvas: ISkCanvas);
+    procedure DrawRope(const ACanvas: ISkCanvas);
+    procedure DrawYarn(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaUnravelGame }
+
+constructor TSkiaUnravelGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FRopePoints := TList<TPointF>.Create;
+  InitLevel;
+  StartThread;
+end;
+
+destructor TSkiaUnravelGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FRopePoints);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaUnravelGame.InitLevel;
+begin
+  FAnchorX := 150;
+  FAnchorY := 100;
+  FYarnX := FAnchorX;
+  FYarnY := FAnchorY + 50;
+  FYarnVelX := 0;
+  FYarnVelY := 0;
+  FOnGround := False;
+end;
+
+procedure TSkiaUnravelGame.ApplyRopeConstraint;
+var
+  Diff: TPointF;
+  Dist, Excess: Single;
+begin
+  // Vector from Anchor to Yarn
+  Diff := TPointF.Create(FYarnX - FAnchorX, FYarnY - FAnchorY);
+  Dist := Diff.Length;
+  
+  // If the rope is stretched beyond max length, pull the yarn back
+  if Dist > MAX_ROPE_LENGTH then
+  begin
+    Excess := Dist - MAX_ROPE_LENGTH;
+    // Normalize Diff to get direction
+    if Dist > 0 then Diff := Diff * (1.0 / Dist);
+    
+    // Move Yarn back to exactly MAX_ROPE_LENGTH
+    FYarnX := FYarnX - Diff.X * Excess;
+    FYarnY := FYarnY - Diff.Y * Excess;
+    
+    // Remove outward velocity component (simple elastic collision)
+    // V = V - (V . Dir) * Dir
+    var DotProduct := (FYarnVelX * Diff.X) + (FYarnVelY * Diff.Y);
+    if DotProduct > 0 then
+    begin
+      FYarnVelX := FYarnVelX - Diff.X * DotProduct;
+      FYarnVelY := FYarnVelY - Diff.Y * DotProduct;
+    end;
+    
+    FOnGround := False; // Can't be on ground if hanging on rope
+  end;
+end;
+
+procedure TSkiaUnravelGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Jump: Boolean;
+  I: Integer;
+  P1, P2, Dir, Perp: TPointF;
+  SegLen: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Jump := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys) or (Byte(vkSpace) in FKeys);
+  finally
+    FLock.Release;
+  end;
+
+  // Consume Jump
+  if Jump then
+  begin
+    if FOnGround then
+    begin
+      FYarnVelY := -600;
+      FOnGround := False;
+    end;
+    FLock.Acquire;
+    try
+      Exclude(FKeys, vkUp); Exclude(FKeys, Byte(Ord('W'))); Exclude(FKeys, vkSpace);
+    finally
+      FLock.Release; end;
+  end;
+
+  // Horizontal Movement
+  if Left then FYarnVelX := Max(FYarnVelX - 1500 * DeltaSec, -250);
+  if Right then FYarnVelX := Min(FYarnVelX + 1500 * DeltaSec, 250);
+  if not Left and not Right then FYarnVelX := FYarnVelX * 0.9; // Friction
+
+  // Gravity
+  FYarnVelY := FYarnVelY + GRAVITY * DeltaSec;
+
+  // Apply Velocity
+  FYarnX := FYarnX + FYarnVelX * DeltaSec;
+  FYarnY := FYarnY + FYarnVelY * DeltaSec;
+
+  // Apply Rope Constraint (Can pull back into walls!)
+  ApplyRopeConstraint;
+
+  // Ground Collision (Screen bottom)
+  if FYarnY > Height - 40 then
+  begin
+    FYarnY := Height - 40;
+    FYarnVelY := 0;
+    FOnGround := True;
+  end;
+
+  // Wall Collision (Basic bounds)
+  if FYarnX < 20 then begin FYarnX := 20; FYarnVelX := 0; end;
+  if FYarnX > Width - 20 then begin FYarnX := Width - 20; FYarnVelX := 0; end;
+
+  // Update Rope Rendering (Sagging effect using Verlet-like points)
+  FRopePoints.Clear;
+  FRopePoints.Add(TPointF.Create(FAnchorX, FAnchorY));
+  
+  // Simple sagging: Add 3 intermediate points
+  for I := 1 to 4 do
+  begin
+    var T := I / 5.0;
+    P1 := TPointF.Create(FAnchorX, FAnchorY);
+    P2 := TPointF.Create(FYarnX, FYarnY);
+    Dir := P2 - P1;
+    SegLen := Dir.Length;
+    
+    // Perpendicular for sagging
+    if SegLen > 0 then
+    begin
+      Perp := TPointF.Create(-Dir.Y, Dir.X) * (1.0 / SegLen);
+      // Sag amount: less sag when rope is tight, more when loose
+      var Sag := Max(0, (MAX_ROPE_LENGTH - SegLen) * 0.3) + 10;
+      if T = 0.5 then Sag := Sag * 2; // Middle sags most
+      
+      FRopePoints.Add(P1 + Dir * T + Perp * Sag);
+    end;
+  end;
+  
+  FRopePoints.Add(TPointF.Create(FYarnX, FYarnY));
+end;
+
+procedure TSkiaUnravelGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  DrawBackground(ACanvas);
+  DrawRope(ACanvas);
+  DrawYarn(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaUnravelGame.DrawBackground(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  ACanvas.Clear($FF1a1a2e); // Dark Blue Night
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Ground
+  Paint.Color := $FF228B22;
+  ACanvas.DrawRect(TRectF.Create(0, Height - 40, Width, Height), Paint);
+  Paint.Color := $FF8B4513;
+  ACanvas.DrawRect(TRectF.Create(0, Height - 30, Width, Height), Paint);
+
+  // Anchor (Nail in the Wall)
+  Paint.Color := $FFAAAAAA;
+  ACanvas.DrawCircle(PointF(FAnchorX, FAnchorY), 8, Paint);
+  Paint.Color := $FF555555;
+  ACanvas.DrawCircle(PointF(FAnchorX, FAnchorY), 4, Paint);
+end;
+
+procedure TSkiaUnravelGame.DrawRope(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  PB: ISkPathBuilder;
+  I: Integer;
+  P: TPointF;
+begin
+  if FRopePoints.Count < 2 then Exit;
+
+  PB := TSkPathBuilder.Create;
+  PB.MoveTo(FRopePoints[0].X, FRopePoints[0].Y);
+  
+  for I := 1 to FRopePoints.Count - 1 do
+  begin
+    P := FRopePoints[I];
+    PB.LineTo(P.X, P.Y);
+  end;
+
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFDDDDDD;
+  Paint.StrokeWidth := 3;
+  Paint.StrokeCap := TSkStrokeCap.Round;
+  
+  ACanvas.DrawPath(PB.Snapshot, Paint);
+end;
+
+procedure TSkiaUnravelGame.DrawYarn(const ACanvas: ISkCanvas);
+var
+  Paint, GlowPaint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFF0000; // Red Yarn
+
+  GlowPaint := TSkPaint.Create(Paint);
+  GlowPaint.MaskFilter := TSkMaskFilter.MakeBlur(TSkBlurStyle.Solid, 6.0);
+  GlowPaint.Color := $FFFF4444;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(FYarnX - 15, FYarnY + 12, FYarnX + 15, FYarnY + 20), Paint);
+  Paint.Alpha := 255;
+  
+  // Body
+  ACanvas.DrawCircle(PointF(FYarnX, FYarnY), 15, GlowPaint);
+  ACanvas.DrawCircle(PointF(FYarnX, FYarnY), 15, Paint);
+  
+  // Yarn String texture (cross)
+  Paint.Color := $FF8B0000;
+  Paint.Style := TSkPaintStyle.Stroke;
+  Paint.StrokeWidth := 2;
+  ACanvas.DrawLine(PointF(FYarnX - 12, FYarnY), PointF(FYarnX + 12, FYarnY), Paint);
+  ACanvas.DrawLine(PointF(FYarnX, FYarnY - 12), PointF(FYarnX, FYarnY + 12), Paint);
+  Paint.Style := TSkPaintStyle.Fill;
+end;
+
+procedure TSkiaUnravelGame.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('A/D: Move | W/Space: Jump | Try to stretch the rope!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaUnravelGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkSpace: Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaUnravelGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkSpace: Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaUnravelGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaUnravelGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaUnravelGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

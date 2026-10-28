@@ -1,0 +1,536 @@
+{*******************************************************************************
+  SkiaMonopoly (Board Game Prototype)
+********************************************************************************
+  A turn-based board game prototype featuring a state machine, linear path 
+  movement, property management, and economy logic.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaMonopoly;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+const
+  BOARD_SIZE = 11; // 11x11 Grid for the cross-shaped board
+  TILE_W = 60;
+
+type
+  TTileKind = (tkCorner, tkProperty, tkGo, tkJail, tkFreeParking, tkGoToJail);
+
+  TTile = class
+    ID: Integer;
+    Pos: TPointF;
+    Kind: TTileKind;
+    Name: string;
+    Price: Integer;
+    Rent: Integer;
+    Owner: Integer; // 0=None, 1=Player, 2=AI
+  end;
+
+  TGameState = (gsRolling, gsMoving, gsLanded, gsWaiting);
+
+  TSkiaMonopoly = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FBoardPath: TList<TPointF>; // Screen coordinates for each tile
+    FTiles: TObjectList<TTile>;
+    
+    FPlayerPosID: Integer;
+    FPlayerTargetID: Integer;
+    FPlayerScreenPos: TPointF;
+    FAIPosID: Integer;
+    FAIScreenPos: TPointF;
+    
+    FMoney: Integer;
+    FAIMoney: Integer;
+    FState: TGameState;
+    FMessage: string;
+    FTimer: Single;
+    FDice: Integer;
+    FIsPlayerTurn: Boolean;
+    
+    procedure InitBoard;
+    procedure RollDice;
+    procedure DoLogicUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure ProcessLanded(PlayerID: Integer; Tile: TTile);
+    procedure DrawBoard(const ACanvas: ISkCanvas);
+    procedure DrawPlayers(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaMonopoly }
+
+constructor TSkiaMonopoly.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FTiles := TObjectList<TTile>.Create(True);
+  FBoardPath := TList<TPointF>.Create;
+  
+  InitBoard;
+  FPlayerPosID := 0;
+  FAIPosID := 0;
+  FPlayerScreenPos := FBoardPath[0];
+  FAIScreenPos := FBoardPath[0];
+  FMoney := 1500;
+  FAIMoney := 1500;
+  FState := gsWaiting;
+  FIsPlayerTurn := True;
+  FMessage := 'Press SPACE to roll the dice!';
+  StartThread;
+end;
+
+destructor TSkiaMonopoly.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FTiles);
+  FreeAndNil(FBoardPath);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaMonopoly.InitBoard;
+var
+  I: Integer;
+  T: TTile;
+  CX, CY: Single;
+begin
+  CX := Width / 2;
+  CY := Height / 2;
+  FBoardPath.Clear;
+  FTiles.Clear;
+  
+  // Build 40 Tiles clockwise starting from GO (Bottom Right)
+  // Simplified: We just generate coordinates and names.
+  for I := 0 to 39 do
+  begin
+    T := TTile.Create;
+    T.ID := I;
+    T.Owner := 0;
+    
+    // Calculate Position on the cross board
+    if I < 10 then begin // Bottom row (Right to Left)
+      T.Pos := PointF(CX + (10-I)*TILE_W - TILE_W/2, CY + 5*TILE_W - TILE_W/2);
+    end
+    else if I < 20 then begin // Left column (Bottom to Top)
+      T.Pos := PointF(CX - 5*TILE_W + TILE_W/2, CY + (10-(I-10))*TILE_W - TILE_W/2);
+    end
+    else if I < 30 then begin // Top row (Left to Right)
+      T.Pos := PointF(CX - 5*TILE_W + (I-20)*TILE_W + TILE_W/2, CY - 5*TILE_W + TILE_W/2);
+    end
+    else begin // Right column (Top to Bottom)
+      T.Pos := PointF(CX + 5*TILE_W - TILE_W/2, CY - 5*TILE_W + (I-30)*TILE_W + TILE_W/2);
+    end;
+    
+    FBoardPath.Add(T.Pos);
+    
+    // Assign Types
+    case I of
+      0: begin T.Kind := tkGo; T.Name := 'GO'; end;
+      10: begin T.Kind := tkJail; T.Name := 'Jail'; end;
+      20: begin T.Kind := tkFreeParking; T.Name := 'Parking'; end;
+      30: begin T.Kind := tkGoToJail; T.Name := 'Go to Jail'; end;
+      5, 15, 25, 35: begin T.Kind := tkProperty; T.Name := 'Station ' + IntToStr(I); T.Price := 200; T.Rent := 25; end;
+      2, 4, 7, 12, 17, 22, 27, 28, 33, 36, 38: begin T.Kind := tkProperty; T.Name := 'Tax/Chance'; T.Price := 0; T.Rent := 0; end;
+    else
+      T.Kind := tkProperty;
+      T.Name := 'Property ' + IntToStr(I);
+      T.Price := 100 + (I mod 5) * 20;
+      T.Rent := 20 + (I mod 5) * 5;
+    end;
+    
+    FTiles.Add(T);
+  end;
+  
+  FPlayerScreenPos := FBoardPath[0];
+  FAIScreenPos := FBoardPath[0];
+end;
+
+procedure TSkiaMonopoly.RollDice;
+begin
+  if FState <> gsWaiting then Exit;
+  FDice := Random(6) + 1 + Random(6) + 1; // 2 to 12
+  FState := gsRolling;
+  FTimer := 1.0; // Dice roll animation time
+  FMessage := 'Rolling...';
+end;
+
+procedure TSkiaMonopoly.DoLogicUpdate(DeltaSec: Double);
+var
+  TargetPos: TPointF;
+  Tile: TTile;
+begin
+  if not FActive then Exit;
+
+  case FState of
+    gsRolling: begin
+                 FTimer := FTimer - DeltaSec;
+                 if FTimer <= 0 then
+                 begin
+                   if FIsPlayerTurn then
+                   begin
+                     FPlayerTargetID := (FPlayerPosID + FDice) mod 40;
+                     FState := gsMoving;
+                     FMessage := 'Moving...';
+                   end
+                   else
+                   begin
+                     FAIPosID := (FAIPosID + FDice) mod 40;
+                     FPlayerTargetID := FAIPosID; // AI moves to this
+                     FState := gsMoving;
+                     FMessage := 'AI Moving...';
+                   end;
+                 end;
+               end;
+    gsMoving: begin
+                // Smoothly move current player to next tile
+                if FIsPlayerTurn then
+                begin
+                  if FPlayerPosID <> FPlayerTargetID then
+                  begin
+                    FPlayerPosID := (FPlayerPosID + 1) mod 40;
+                    if FPlayerPosID = 0 then
+                    begin
+                      FMoney := FMoney + 200; // Passed GO
+                      FMessage := 'Passed GO! +200$';
+                    end;
+                  end;
+                  
+                  TargetPos := FBoardPath[FPlayerPosID];
+                  FPlayerScreenPos.X := FPlayerScreenPos.X + (TargetPos.X - FPlayerScreenPos.X) * 10 * DeltaSec;
+                  FPlayerScreenPos.Y := FPlayerScreenPos.Y + (TargetPos.Y - FPlayerScreenPos.Y) * 10 * DeltaSec;
+                  
+                  if Hypot(FPlayerScreenPos.X - TargetPos.X, FPlayerScreenPos.Y - TargetPos.Y) < 2 then
+                  begin
+                    FPlayerScreenPos := TargetPos;
+                    if FPlayerPosID = FPlayerTargetID then
+                    begin
+                      FState := gsLanded;
+                      FTimer := 0.5;
+                    end;
+                  end;
+                end
+                else
+                begin
+                  // AI Movement (Instant for prototype simplicity)
+                  FAIScreenPos := FBoardPath[FAIPosID];
+                  FState := gsLanded;
+                  FTimer := 0.5;
+                end;
+              end;
+    gsLanded: begin
+                FTimer := FTimer - DeltaSec;
+                if FTimer <= 0 then
+                begin
+                  if FIsPlayerTurn then
+                    ProcessLanded(1, FTiles[FPlayerPosID])
+                  else
+                    ProcessLanded(2, FTiles[FAIPosID]);
+                end;
+              end;
+    gsWaiting: begin
+                 // Waiting for input
+               end;
+  end;
+end;
+
+procedure TSkiaMonopoly.ProcessLanded(PlayerID: Integer; Tile: TTile);
+begin
+  if Tile.Kind = tkProperty then
+  begin
+    if Tile.Owner = 0 then
+    begin
+      if (PlayerID = 1) then
+      begin
+        // Ask Player to buy
+        FMessage := Tile.Name + ' costs ' + IntToStr(Tile.Price) + '$. Press Y to buy.';
+        FState := gsWaiting; // Wait for Y key
+      end
+      else
+      begin
+        // AI auto buys if it can afford it
+        if FAIMoney > Tile.Price + 100 then
+        begin
+          FAIMoney := FAIMoney - Tile.Price;
+          Tile.Owner := 2;
+          FMessage := 'AI bought ' + Tile.Name;
+        end;
+        FTimer := 1.5;
+        FState := gsLanded; // Wait a bit, then end turn
+      end;
+    end
+    else if Tile.Owner <> PlayerID then
+    begin
+      // Pay Rent
+      if PlayerID = 1 then
+      begin
+        FMoney := FMoney - Tile.Rent;
+        FAIMoney := FAIMoney + Tile.Rent;
+        FMessage := 'Paid ' + IntToStr(Tile.Rent) + '$ rent to AI!';
+      end
+      else
+      begin
+        FAIMoney := FAIMoney - Tile.Rent;
+        FMoney := FMoney + Tile.Rent;
+        FMessage := 'AI paid you ' + IntToStr(Tile.Rent) + '$ rent!';
+      end;
+      FTimer := 1.5;
+      FState := gsLanded;
+    end;
+  end
+  else if Tile.Kind = tkGoToJail then
+  begin
+    FMessage := 'Go to Jail!';
+    if PlayerID = 1 then FPlayerPosID := 10 else FAIPosID := 10;
+    FPlayerTargetID := 10;
+    FState := gsMoving;
+    Exit;
+  end;
+  
+  // End Turn if not waiting for Y
+  if FState = gsLanded then
+  begin
+    FTimer := FTimer - 1.0; // Hack to trigger next state after delay
+    if FTimer <= 0 then
+    begin
+      FIsPlayerTurn := not FIsPlayerTurn;
+      if FIsPlayerTurn then
+        FMessage := 'Your turn! Press SPACE to roll.'
+      else
+      begin
+        FMessage := 'AI's turn...';
+        RollDice; // AI rolls immediately
+      end;
+      FState := gsWaiting;
+    end;
+  end;
+end;
+
+procedure TSkiaMonopoly.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF0a3d0a); // Classic Monopoly Green Felt
+  DrawBoard(ACanvas);
+  DrawPlayers(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaMonopoly.DrawBoard(const ACanvas: ISkCanvas);
+var
+  T: TTile;
+  Paint, TextPaint: ISkPaint;
+  Rect: TRectF;
+  Font: TSkFont;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  TextPaint := TSkPaint.Create(TSkPaintStyle.Fill);
+  TextPaint.AntiAlias := True;
+  TextPaint.Color := $FF000000;
+  Font := TSkFont.Create;
+  Font.Size := 8;
+  
+  for T in FTiles do
+  begin
+    Rect := TRectF.Create(T.Pos.X - TILE_W/2, T.Pos.Y - TILE_W/2, T.Pos.X + TILE_W/2, T.Pos.Y + TILE_W/2);
+    
+    // Base Color
+    case T.Kind of
+      tkCorner, tkGo, tkJail, tkFreeParking, tkGoToJail: Paint.Color := $FFCCCCCC;
+      tkProperty: Paint.Color := $FFEEEEEE;
+    end;
+    ACanvas.DrawRect(Rect, Paint);
+    
+    // Owner Color Bar
+    if T.Owner > 0 then
+    begin
+      if T.Owner = 1 then Paint.Color := $FF0000FF else Paint.Color := $FFFF0000;
+      ACanvas.DrawRect(TRectF.Create(Rect.Left, Rect.Top, Rect.Right, Rect.Top + 8), Paint);
+    end;
+    
+    // Text
+    ACanvas.DrawSimpleText(T.Name, Rect.Left + 2, Rect.Top + 15, Font, TextPaint);
+    if T.Price > 0 then
+      ACanvas.DrawSimpleText('$' + IntToStr(T.Price), Rect.Left + 2, Rect.Bottom - 4, Font, TextPaint);
+  end;
+  Font.Free;
+end;
+
+procedure TSkiaMonopoly.DrawPlayers(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // AI (Red) - Draw slightly offset
+  Paint.Color := $FFFF0000;
+  ACanvas.DrawCircle(PointF(FAIScreenPos.X + 10, FAIScreenPos.Y), 12, Paint);
+  
+  // Player (Blue)
+  Paint.Color := $FF0000FF;
+  ACanvas.DrawCircle(PointF(FPlayerScreenPos.X - 10, FPlayerScreenPos.Y), 12, Paint);
+end;
+
+procedure TSkiaMonopoly.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+  Txt: string;
+begin
+  Font := TSkFont.Create;
+  Font.Size := 14;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    
+    // Top Left Info
+    Paint.Color := $FF0000FF;
+    ACanvas.DrawRect(TRectF.Create(10, 10, 200, 80), Paint);
+    Paint.Color := $FFFFFFFF;
+    Txt := 'You: ' + IntToStr(FMoney) + '$';
+    ACanvas.DrawSimpleText(Txt, 20, 35, Font, Paint);
+    ACanvas.DrawSimpleText(FMessage, 20, 60, Font, Paint);
+    
+    // Top Right Info
+    Paint.Color := $FFFF0000;
+    ACanvas.DrawRect(TRectF.Create(Width - 210, 10, Width - 10, 80), Paint);
+    Paint.Color := $FFFFFFFF;
+    Txt := 'AI: ' + IntToStr(FAIMoney) + '$';
+    ACanvas.DrawSimpleText(Txt, Width - 200, 35, Font, Paint);
+    
+    // Dice
+    if FDice > 0 then
+    begin
+      Paint.Color := $FFFFFFFF;
+      Paint.Alpha := 200;
+      ACanvas.DrawRoundRect(TRectF.Create(Width/2 - 40, 10, Width/2 + 40, 60), 8, 8, Paint);
+      Paint.Alpha := 255;
+      Paint.Color := $FF000000;
+      ACanvas.DrawSimpleText('Dice: ' + IntToStr(FDice), Width/2 - 35, 45, Font, Paint);
+    end;
+    
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaMonopoly.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+var
+  Tile: TTile;
+begin
+  FLock.Acquire;
+  try
+    if (Key = vkSpace) and FIsPlayerTurn and (FState = gsWaiting) then
+    begin
+      RollDice;
+    end
+    else if (KeyChar = 'Y') or (KeyChar = 'y') then
+    begin
+      if (FState = gsWaiting) and FIsPlayerTurn then
+      begin
+        Tile := FTiles[FPlayerPosID];
+        if (Tile.Owner = 0) and (FMoney >= Tile.Price) then
+        begin
+          FMoney := FMoney - Tile.Price;
+          Tile.Owner := 1;
+          FMessage := 'You bought ' + Tile.Name + '!';
+          FTimer := 1.5;
+          FState := gsLanded; // Resume turn ending
+        end;
+      end;
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaMonopoly.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  // Not needed for board game
+  inherited;
+end;
+
+procedure TSkiaMonopoly.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaMonopoly.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoLogicUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaMonopoly.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

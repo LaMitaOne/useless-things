@@ -1,0 +1,540 @@
+{*******************************************************************************
+  SkiaStarFox (3D Vector Engine Prototype)
+********************************************************************************
+  A 3D vector graphics prototype inspired by Star Fox (SNES). Features a custom 
+  3D projection engine (X/Y/Z to 2D screen), 3D polygon rendering, and 3D movement.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaStarFox;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TPoint3D = record
+    X, Y, Z: Single;
+  end;
+
+  TFace = array[0..3] of Integer; // Indices for a quad
+
+  TModel = class
+  public
+    Points: array of TPoint3D;
+    Faces: array of TFace;
+    Pos: TPoint3D;
+    RotX, RotY, Single;
+    Color: TAlphaColor;
+    IsEnemy: Boolean;
+    HP: Integer;
+    Dead: Boolean;
+  end;
+
+  TSkiaStarFoxGame = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    FKeys: set of Byte;
+    
+    FModels: TObjectList<TModel>;
+    FPlayer: TModel;
+    FProjectiles: TList<TPoint3D>;
+    
+    FPlayerX, FPlayerY: Single;
+    FCameraZ: Single;
+    FSpawnTimer: Single;
+    FBossActive: Boolean;
+    FWinTimer: Single;
+    
+    procedure InitModels;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure CreateCube(Size: Single);
+    procedure CreatePlayer;
+    procedure SpawnEnemy;
+    
+    function Project3D(P: TPoint3D; ScreenW, ScreenH: Single): TPointF;
+    procedure RotatePoint(var P: TPoint3D; RX, RY, RZ: Single);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+    procedure KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaStarFoxGame }
+
+constructor TSkiaStarFoxGame.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+  TabStop := True;
+
+  FActive := True;
+  FModels := TObjectList<TModel>.Create(True);
+  FProjectiles := TList<TPoint3D>.Create;
+  InitModels;
+  StartThread;
+end;
+
+destructor TSkiaStarFoxGame.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FModels);
+  FreeAndNil(FProjectiles);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaStarFoxGame.InitModels;
+begin
+  FModels.Clear;
+  FProjectiles.Clear;
+  FCameraZ := 0;
+  FPlayerX := 0;
+  FPlayerY := 0;
+  FSpawnTimer := 2.0;
+  FBossActive := False;
+  FWinTimer := 0;
+  
+  CreatePlayer;
+end;
+
+procedure TSkiaStarFoxGame.CreatePlayer;
+var
+  M: TModel;
+begin
+  M := TModel.Create;
+  SetLength(M.Points, 5);
+  // Ship: Nose, BackLeft, BackRight, TopLeft, TopRight
+  M.Points[0] := (X: 0; Y: 0; Z: 10);
+  M.Points[1] := (X: -5; Y: 0; Z: -5);
+  M.Points[2] := (X: 5; Y: 0; Z: -5);
+  M.Points[3] := (X: -3; Y: 3; Z: -2);
+  M.Points[4] := (X: 3; Y: 3; Z: -2);
+  
+  SetLength(M.Faces, 4);
+  M.Faces[0] := (0, 1, 2, 2); // Bottom (Triangle)
+  M.Faces[1] := (0, 1, 3, 3); // Left Wing
+  M.Faces[2] := (0, 2, 4, 4); // Right Wing
+  M.Faces[3] := (1, 2, 4, 3); // Back
+  
+  M.Pos := (X: 0; Y: 0; Z: 0);
+  M.Color := $FF00FF00;
+  M.IsEnemy := False;
+  FPlayer := M;
+  FModels.Add(M);
+end;
+
+procedure TSkiaStarFoxGame.CreateCube(Size: Single);
+var
+  M: TModel;
+  S: Single;
+begin
+  M := TModel.Create;
+  S := Size / 2;
+  SetLength(M.Points, 8);
+  // 8 Corners of a cube
+  M.Points[0] := (X: -S; Y: -S; Z: -S);
+  M.Points[1] := (X:  S; Y: -S; Z: -S);
+  M.Points[2] := (X:  S; Y:  S; Z: -S);
+  M.Points[3] := (X: -S; Y:  S; Z: -S);
+  M.Points[4] := (X: -S; Y: -S; Z:  S);
+  M.Points[5] := (X:  S; Y: -S; Z:  S);
+  M.Points[6] := (X:  S; Y:  S; Z:  S);
+  M.Points[7] := (X: -S; Y:  S; Z:  S);
+  
+  SetLength(M.Faces, 6);
+  M.Faces[0] := (0, 1, 2, 3); // Front
+  M.Faces[1] := (4, 5, 6, 7); // Back
+  M.Faces[2] := (0, 1, 5, 4); // Bottom
+  M.Faces[3] := (2, 3, 7, 6); // Top
+  M.Faces[4] := (0, 3, 7, 4); // Left
+  M.Faces[5] := (1, 2, 6, 5); // Right
+  
+  M.IsEnemy := True;
+  M.HP := 3;
+  M.Dead := False;
+  FModels.Add(M);
+end;
+
+procedure TSkiaStarFoxGame.SpawnEnemy;
+var
+  M: TModel;
+begin
+  CreateCube(4 + Random(4));
+  M := FModels.Last;
+  M.Pos := (X: (Random - 0.5) * 60; Y: (Random - 0.5) * 40; Z: FCameraZ - 80);
+  M.Color := $FFFF0000;
+end;
+
+procedure TSkiaStarFoxGame.RotatePoint(var P: TPoint3D; RX, RY, RZ: Single);
+var
+  X, Y, Z: Single;
+begin
+  // Rotate X
+  Y := P.Y * Cos(RX) - P.Z * Sin(RX);
+  Z := P.Y * Sin(RX) + P.Z * Cos(RX);
+  P.Y := Y; P.Z := Z;
+  
+  // Rotate Y
+  X := P.X * Cos(RY) + P.Z * Sin(RY);
+  Z := -P.X * Sin(RY) + P.Z * Cos(RY);
+  P.X := X; P.Z := Z;
+  
+  // Rotate Z (Not needed for this prototype)
+  // X := P.X * Cos(RZ) - P.Y * Sin(RZ);
+  // Y := P.X * Sin(RZ) + P.Y * Cos(RZ);
+  // P.X := X; P.Y := Y;
+end;
+
+function TSkiaStarFoxGame.Project3D(P: TPoint3D; ScreenW, ScreenH: Single): TPointF;
+var
+  ZPos: Single;
+begin
+  ZPos := P.Z - FCameraZ;
+  if ZPos >= -1 then ZPos := -1.1; // Clip to camera (Prevent division by zero/behind camera)
+  
+  // Perspective Projection: X' = (X * FocalLength) / Z
+  Result.X := (P.X * 20) / ZPos + ScreenW / 2;
+  Result.Y := (P.Y * 20) / ZPos + ScreenH / 2;
+end;
+
+procedure TSkiaStarFoxGame.DoPhysicsUpdate(DeltaSec: Double);
+var
+  Left, Right, Up, Down, Shoot: Boolean;
+  I, J: Integer;
+  M: TModel;
+  P: TPoint3D;
+  Dist: Single;
+begin
+  if not FActive then Exit;
+
+  FLock.Acquire;
+  try
+    Left := (Byte(vkLeft) in FKeys) or (Byte(Ord('A')) in FKeys);
+    Right := (Byte(vkRight) in FKeys) or (Byte(Ord('D')) in FKeys);
+    Up := (Byte(vkUp) in FKeys) or (Byte(Ord('W')) in FKeys);
+    Down := (Byte(vkDown) in FKeys) or (Byte(Ord('S')) in FKeys);
+    Shoot := (Byte(vkSpace) in FKeys) or (Byte(Ord('J')) in FKeys);
+    if Shoot then
+    begin
+      Exclude(FKeys, vkSpace); Exclude(FKeys, Byte(Ord('J')));
+      // Spawn Projectile
+      P := FPlayer.Pos;
+      P.Z := FPlayer.Pos.Z - 5; // Shoot from nose
+      FProjectiles.Add(P);
+    end;
+  finally
+    FLock.Release;
+  end;
+
+  // Player Movement
+  if Left then FPlayerX := Max(FPlayerX - 50 * DeltaSec, -30);
+  if Right then FPlayerX := Min(FPlayerX + 50 * DeltaSec, 30);
+  if Up then FPlayerY := Max(FPlayerY - 50 * DeltaSec, -20);
+  if Down then FPlayerY := Min(FPlayerY + 50 * DeltaSec, 20);
+  
+  FPlayer.Pos.X := FPlayerX;
+  FPlayer.Pos.Y := FPlayerY;
+  FPlayer.RotZ := -FPlayerX * 0.02; // Bank left/right
+  FPlayer.RotX := FPlayerY * 0.02; // Pitch up/down
+
+  // Move Camera (Player flies forward)
+  FCameraZ := FCameraZ - 100 * DeltaSec;
+
+  // Update Projectiles
+  for I := FProjectiles.Count - 1 downto 0 do
+  begin
+    P := FProjectiles[I];
+    P.Z := P.Z - 200 * DeltaSec; // Fly forward
+    FProjectiles[I] := P;
+    
+    // Out of range
+    if P.Z < FCameraZ - 100 then
+    begin
+      FProjectiles.Delete(I);
+      Continue;
+    end;
+    
+    // Check Collision with Enemies
+    for J := 0 to FModels.Count - 1 do
+    begin
+      M := FModels[J];
+      if not M.IsEnemy or M.Dead then Continue;
+      
+      Dist := Hypot(P.X - M.Pos.X, P.Y - M.Pos.Y);
+      if (Abs(P.Z - M.Pos.Z) < 5) and (Dist < 5) then
+      begin
+        Dec(M.HP);
+        M.Color := $FFFFFF00; // Flash yellow
+        FProjectiles.Delete(I);
+        if M.HP <= 0 then M.Dead := True;
+        Break;
+      end;
+    end;
+  end;
+
+  // Update Enemies
+  for I := FModels.Count - 1 downto 0 do
+  {
+    M := FModels[I];
+    if not M.IsEnemy then Continue;
+    
+    if M.Dead then
+    begin
+      FModels.Delete(I);
+      Continue;
+    end;
+    
+    // Enemy AI: Fly towards player Z and shoot forward
+    M.Pos.Z := M.Pos.Z - 50 * DeltaSec;
+    M.RotX := M.RotX + 1 * DeltaSec;
+    M.RotY := M.RotY + 1 * DeltaSec;
+    
+    // Collision with Player
+    if (Abs(M.Pos.Z - FPlayer.Pos.Z) < 5) and (Hypot(M.Pos.X - FPlayer.Pos.X, M.Pos.Y - FPlayer.Pos.Y) < 5) then
+    begin
+      // Simple Death: Reset
+      InitModels;
+      Exit;
+    end;
+    
+    // Passed player
+    if M.Pos.Z > FCameraZ + 10 then
+    begin
+      FModels.Delete(I);
+      Continue;
+    end;
+    
+    // Restore color
+    if M.HP > 0 then M.Color := $FFFF0000;
+  end;
+
+  // Spawning
+  FSpawnTimer := FSpawnTimer - DeltaSec;
+  if FSpawnTimer <= 0 then
+  {
+    SpawnEnemy;
+    FSpawnTimer := 1.5;
+  }
+end;
+
+procedure TSkiaStarFoxGame.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+var
+  I, J: Integer;
+  M: TModel;
+  P, P1, P2, P3, P4: TPointF;
+  PB: ISkPathBuilder;
+  Paint: ISkPaint;
+  Proj: TPoint3D;
+  Center3D: TPoint3D;
+  SortList: TList<TModel>;
+begin
+  ACanvas.Clear($FF000011); // Space Black
+  
+  // Draw Stars (Background)
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  Paint.Color := $FFFFFFFF;
+  for I := 0 to 50 do
+  {
+    // Fake 3D Stars
+    P := Project3D((X: (I*137) mod 100 - 50; Y: (I*271) mod 100 - 50; Z: -200 + (I*10)), Width, Height);
+    ACanvas.DrawCircle(P, 1, Paint);
+  }
+  
+  // Sort Models by Z (Painter's Algorithm)
+  SortList := TList<TModel>.Create;
+  try
+    for I := 0 to FModels.Count - 1 do SortList.Add(FModels[I]);
+    SortList.Sort(TComparer<TModel>.Construct(
+      function(const A, B: TModel): Integer
+      begin
+        Result := CompareValue(B.Pos.Z, A.Pos.Z); // Far to near
+      end));
+      
+    // Draw Models
+    for I := 0 to SortList.Count - 1 do
+    begin
+      M := SortList[I];
+      
+      // Project all points
+      var ProjPoints: array of TPointF;
+      SetLength(ProjPoints, Length(M.Points));
+      
+      for J := 0 to High(M.Points) do
+      {
+        Proj := M.Points[J];
+        // Rotate around Model Center
+        Proj.X := Proj.X - M.Pos.X; // Translate to origin
+        Proj.Y := Proj.Y - M.Pos.Y;
+        Proj.Z := Proj.Z - M.Pos.Z;
+        
+        RotatePoint(Proj, M.RotX, M.RotY, M.RotZ);
+        
+        Proj.X := Proj.X + M.Pos.X; // Translate back
+        Proj.Y := Proj.Y + M.Pos.Y;
+        Proj.Z := Proj.Z + M.Pos.Z;
+        
+        ProjPoints[J] := Project3D(Proj, Width, Height);
+      end;
+      
+      // Draw Faces
+      Paint.Color := M.Color;
+      Paint.AntiAlias := True;
+      
+      for J := 0 to High(M.Faces) do
+      begin
+        PB := TSkPathBuilder.Create;
+        P1 := ProjPoints[M.Faces[J][0]];
+        P2 := ProjPoints[M.Faces[J][1]];
+        P3 := ProjPoints[M.Faces[J][2]];
+        P4 := ProjPoints[M.Faces[J][3]];
+        
+        PB.MoveTo(P1.X, P1.X); // Bug fix: X instead of Y? No, Y!
+        PB.MoveTo(P1.X, P1.Y);
+        PB.LineTo(P2.X, P2.Y);
+        PB.LineTo(P3.X, P3.Y);
+        PB.LineTo(P4.X, P4.Y);
+        PB.Close;
+        
+        ACanvas.DrawPath(PB.Snapshot, Paint);
+        
+        // Draw wireframe outline
+        Paint.Style := TSkPaintStyle.Stroke;
+        Paint.Color := $FFFFFFFF;
+        Paint.StrokeWidth := 1;
+        ACanvas.DrawPath(PB.Snapshot, Paint);
+        Paint.Style := TSkPaintStyle.Fill;
+        Paint.Color := M.Color;
+      end;
+    end;
+  finally
+    SortList.Free;
+  end;
+  
+  // Draw Projectiles
+  Paint.Color := $FF00FFFF;
+  for I := 0 to FProjectiles.Count - 1 do
+  begin
+    P := Project3D(FProjectiles[I], Width, Height);
+    ACanvas.DrawCircle(P, 3, Paint);
+  end;
+  
+  // Draw UI
+  var Font := TSkFont.Create;
+  try
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('WASD/Arrows: Fly | Space/J: Shoot', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaStarFoxGame.KeyDown(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Include(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Include(FKeys, vtkRight);
+      vkUp, Byte(Ord('W')): Include(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Include(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Include(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarFoxGame.KeyUp(var Key: Word; var KeyChar: WideChar; Shift: TShiftState);
+begin
+  FLock.Acquire;
+  try
+    case Key of
+      vkLeft, Byte(Ord('A')): Exclude(FKeys, vkLeft);
+      vkRight, Byte(Ord('D')): Exclude(FKeys, vtkRight);
+      vkUp, Byte(Ord('W')): Exclude(FKeys, vkUp);
+      vkDown, Byte(Ord('S')): Exclude(FKeys, vkDown);
+      vkSpace, Byte(Ord('J')): Exclude(FKeys, vkSpace);
+    end;
+  finally
+    FLock.Release;
+  end;
+  Key := 0;
+  inherited;
+end;
+
+procedure TSkiaStarFoxGame.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaStarFoxGame.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaStarFoxGame.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

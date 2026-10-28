@@ -1,0 +1,438 @@
+{*******************************************************************************
+  SkiaPointAndClick (Adventure Prototype)
+********************************************************************************
+  A point-and-click prototype featuring walkable polygon areas (path masks),
+  interactable objects, and a simple state machine for puzzles.
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaPointAndClick;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TInteractable = class
+    Name: string;
+    Bounds: TRectF;
+    IsOpen: Boolean;
+    Color: TAlphaColor;
+  end;
+
+  TSkiaPointAndClick = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    
+    FPlayerX, FPlayerY: Single;
+    FTargetX, FTargetY: Single;
+    FIsMoving: Boolean;
+    FAnimPhase: Single;
+    
+    FWalkPath: ISkPath; // The polygon defining the walkable area
+    FInteractables: TObjectList<TInteractable>;
+    
+    FCurrentRoom: Integer;
+    FMessage: string;
+    FMessageTimer: Single;
+    
+    procedure InitRoom(Room: Integer);
+    procedure DoLogicUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure DrawBackground(const ACanvas: ISkCanvas);
+    procedure DrawWalkArea(const ACanvas: ISkCanvas);
+    procedure DrawInteractables(const ACanvas: ISkCanvas);
+    procedure DrawPlayer(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaPointAndClick }
+
+constructor TSkiaPointAndClick.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+
+  FActive := True;
+  FInteractables := TObjectList<TInteractable>.Create(True);
+  FCurrentRoom := 1;
+  InitRoom(FCurrentRoom);
+  StartThread;
+end;
+
+destructor TSkiaPointAndClick.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FInteractables);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaPointAndClick.InitRoom(Room: Integer);
+var
+  PB: ISkPathBuilder;
+  Item: TInteractable;
+begin
+  FInteractables.Clear;
+  FMessage := '';
+  FMessageTimer := 0;
+
+  if Room = 1 then
+  begin
+    // Room 1: Hallway
+    // Define Walkable Polygon (A weird shape avoiding a desk)
+    PB := TSkPathBuilder.Create;
+    PB.MoveTo(100, 400);
+    PB.LineTo(500, 400);
+    PB.LineTo(500, 250); // Go up around desk
+    PB.LineTo(800, 250);
+    PB.LineTo(800, 500);
+    PB.LineTo(100, 500);
+    PB.Close;
+    FWalkPath := PB.Snapshot;
+
+    FPlayerX := 150;
+    FPlayerY := 450;
+    FTargetX := FPlayerX;
+    FTargetY := FPlayerY;
+
+    // Locker (Needs to be opened first)
+    Item := TInteractable.Create;
+    Item.Name := 'Locker';
+    Item.Bounds := TRectF.Create(700, 150, 760, 250);
+    Item.IsOpen := False;
+    Item.Color := $FFFF0000; // Red
+    FInteractables.Add(Item);
+
+    // Door (Exit)
+    Item := TInteractable.Create;
+    Item.Name := 'Door';
+    Item.Bounds := TRectF.Create(200, 100, 300, 400);
+    Item.IsOpen := False;
+    Item.Color := $FF8B4513; // Brown
+    FInteractables.Add(Item);
+  end
+  else if Room = 2 then
+  begin
+    // Room 2: The Vault
+    PB := TSkPathBuilder.Create;
+    PB.MoveTo(200, 300);
+    PB.LineTo(900, 300);
+    PB.LineTo(900, 550);
+    PB.LineTo(200, 550);
+    PB.Close;
+    FWalkPath := PB.Snapshot;
+
+    FPlayerX := 250;
+    FPlayerY := 400;
+    FTargetX := FPlayerX;
+    FTargetY := FPlayerY;
+
+    // Treasure
+    Item := TInteractable.Create;
+    Item.Name := 'Treasure';
+    Item.Bounds := TRectF.Create(600, 200, 750, 300);
+    Item.IsOpen := False;
+    Item.Color := $FFFFD700; // Gold
+    FInteractables.Add(Item);
+  end;
+end;
+
+procedure TSkiaPointAndClick.DoLogicUpdate(DeltaSec: Double);
+var
+  DX, DY, Dist: Single;
+begin
+  if not FActive then Exit;
+
+  if FMessageTimer > 0 then
+    FMessageTimer := FMessageTimer - DeltaSec;
+
+  if FIsMoving then
+  begin
+    DX := FTargetX - FPlayerX;
+    DY := FTargetY - FPlayerY;
+    Dist := Hypot(DX, DY);
+    
+    if Dist < 4 then
+    begin
+      FPlayerX := FTargetX;
+      FPlayerY := FTargetY;
+      FIsMoving := False;
+    end
+    else
+    begin
+      FPlayerX := FPlayerX + (DX / Dist) * 150 * DeltaSec;
+      FPlayerY := FPlayerY + (DY / Dist) * 150 * DeltaSec;
+      FAnimPhase := FAnimPhase + DeltaSec * 10;
+    end;
+  end
+  else
+    FAnimPhase := 0;
+end;
+
+procedure TSkiaPointAndClick.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  I: Integer;
+  Item: TInteractable;
+  ClickPoint: TPointF;
+  PlayerRect: TRectF;
+begin
+  ClickPoint := PointF(X, Y);
+
+  // 1. Did we click an interactable?
+  for I := 0 to FInteractables.Count - 1 do
+  begin
+    Item := FInteractables[I];
+    if Item.Bounds.Contains(ClickPoint) then
+    begin
+      // Check distance to object
+      PlayerRect := TRectF.Create(FPlayerX - 30, FPlayerY - 10, FPlayerX + 30, FPlayerY + 10);
+      if not PlayerRect.Intersects(Item.Bounds) then
+      begin
+        // Too far, walk closer first
+        FTargetX := Item.Bounds.Left - 20;
+        FTargetY := Item.Bounds.Bottom;
+        FIsMoving := True;
+        FMessage := 'Walking to ' + Item.Name + '...';
+        FMessageTimer := 2.0;
+        Exit;
+      end;
+      
+      // We are close enough! Interact!
+      if Item.Name = 'Locker' then
+      begin
+        Item.IsOpen := True;
+        Item.Color := $FF00FF00; // Green
+        FMessage := 'You opened the locker! A key fell out.';
+        FMessageTimer := 3.0;
+      end
+      else if Item.Name = 'Door' then
+      begin
+        if FInteractables[0].IsOpen then // Locker was opened
+        begin
+          FMessage := 'You use the key. Entering the Vault...';
+          FMessageTimer := 2.0;
+          TThread.CreateAnonymousThread(
+            procedure
+            begin
+              Sleep(2000);
+              TThread.Queue(nil, procedure begin InitRoom(2); end);
+            end).Start;
+        end
+        else
+        begin
+          FMessage := 'The door is locked. I need a key.';
+          FMessageTimer := 3.0;
+        end;
+      end
+      else if Item.Name = 'Treasure' then
+      begin
+        Item.IsOpen := True;
+        FMessage := 'YOU WIN! The treasure is ours!';
+        FMessageTimer := 10.0;
+      end;
+      Exit;
+    end;
+  end;
+
+  // 2. Otherwise, just walk to the clicked spot if it's in the walk area
+  if Assigned(FWalkPath) and FWalkPath.Contains(ClickPoint) then
+  begin
+    FTargetX := X;
+    FTargetY := Y;
+    FIsMoving := True;
+  end
+  else
+  begin
+    FMessage := 'I can't walk there.';
+    FMessageTimer := 2.0;
+  end;
+
+  inherited;
+end;
+
+procedure TSkiaPointAndClick.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  DrawBackground(ACanvas);
+  DrawWalkArea(ACanvas);
+  DrawInteractables(ACanvas);
+  DrawPlayer(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaPointAndClick.DrawBackground(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  if FCurrentRoom = 1 then
+    ACanvas.Clear($FF2F1F1F) // Dark Hallway
+  else
+    ACanvas.Clear($FF1F2F2F); // Vault Blueish
+
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.Color := $FF111111;
+  ACanvas.DrawRect(TRectF.Create(0, Height-50, Width, Height), Paint); // Floor baseline
+end;
+
+procedure TSkiaPointAndClick.DrawWalkArea(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  if not Assigned(FWalkPath) then Exit;
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.Color := $FFFF0000;
+  Paint.Alpha := 100;
+  Paint.StrokeWidth := 2;
+  Paint.PathEffect := TSkPathEffect.MakeDash([4, 4], 0);
+  ACanvas.DrawPath(FWalkPath, Paint); // Debug visualization
+end;
+
+procedure TSkiaPointAndClick.DrawInteractables(const ACanvas: ISkCanvas);
+var
+  Item: TInteractable;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for Item in FInteractables do
+  begin
+    Paint.Color := Item.Color;
+    ACanvas.DrawRect(Item.Bounds, Paint);
+    
+    Paint.Color := $FFFFFFFF;
+    Paint.Style := TSkPaintStyle.Stroke;
+    Paint.StrokeWidth := 2;
+    ACanvas.DrawRect(Item.Bounds, Paint);
+    Paint.Style := TSkPaintStyle.Fill;
+  end;
+end;
+
+procedure TSkiaPointAndClick.DrawPlayer(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  Breathe: Single;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Shadow
+  Paint.Color := $FF000000;
+  Paint.Alpha := 80;
+  ACanvas.DrawOval(TRectF.Create(FPlayerX-10, FPlayerY+12, FPlayerX+10, FPlayerY+18), Paint);
+  Paint.Alpha := 255;
+
+  if not FIsMoving then Breathe := Sin(FAnimPhase * 0.2) * 1.0 else Breathe := 0;
+  
+  // Body
+  Paint.Color := $FF3333AA;
+  ACanvas.DrawRoundRect(TRectF.Create(FPlayerX-8, FPlayerY-15-Breathe, FPlayerX+8, FPlayerY+5+Breathe), 3, 3, Paint);
+  
+  // Head
+  Paint.Color := $FFFFD700;
+  ACanvas.DrawCircle(PointF(FPlayerX, FPlayerY-20), 6, Paint);
+end;
+
+procedure TSkiaPointAndClick.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create;
+    Paint.Style := TSkPaintStyle.Fill;
+    Paint.AntiAlias := True;
+    
+    // Text Box at bottom
+    if FMessageTimer > 0 then
+    begin
+      Paint.Color := $AA000000;
+      ACanvas.DrawRect(TRectF.Create(0, Height-80, Width, Height), Paint);
+      Paint.Color := $FFFFFFFF;
+      ACanvas.DrawSimpleText(FMessage, 20, Height-40, Font, Paint);
+    end;
+    
+    Paint.Color := TAlphaColors.Yellow;
+    if FCurrentRoom = 1 then
+      ACanvas.DrawSimpleText('Room 1: Find a way to open the Door', 10, 30, Font, Paint)
+    else
+      ACanvas.DrawSimpleText('Room 2: The Vault', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaPointAndClick.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end);
+end;
+
+procedure TSkiaPointAndClick.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoLogicUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaPointAndClick.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.

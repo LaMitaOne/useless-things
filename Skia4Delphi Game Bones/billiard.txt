@@ -1,0 +1,461 @@
+{*******************************************************************************
+  SkiaBilliard (Pool Physics Prototype)
+********************************************************************************
+  A 2D billiards prototype featuring elastic collisions (conservation of momentum),
+  cushion bouncing, friction, and pocketing. 
+  
+  Author:  Lara Miriam Tamy Reschke
+  License: MIT
+*******************************************************************************}
+
+unit SkiaBilliard;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.Classes, System.Math,
+  System.Generics.Collections, System.UITypes, System.SyncObjs, FMX.Types,
+  FMX.Controls, FMX.Forms, FMX.Skia, System.Skia;
+
+type
+  TBall = class
+  public
+    Pos: TPointF;
+    Vel: TPointF;
+    Radius: Single;
+    Color: TAlphaColor;
+    IsCue: Boolean;
+    Pocketed: Boolean;
+  end;
+
+  TSkiaBilliard = class(TSkCustomControl)
+  private
+    FThread: TThread;
+    FActive: Boolean;
+    FLock: TCriticalSection;
+    
+    FBalls: TObjectList<TBall>;
+    FTableRect: TRectF;
+    FPockets: TList<TPointF>;
+    
+    FIsAiming: Boolean;
+    FAimStart: TPointF;
+    FAimCurrent: TPointF;
+    
+    procedure InitGame;
+    procedure DoPhysicsUpdate(DeltaSec: Double);
+    procedure SafeInvalidate;
+    procedure StartThread;
+    procedure StopThread;
+    
+    procedure ProcessCollisions;
+    procedure DrawTable(const ACanvas: ISkCanvas);
+    procedure DrawAiming(const ACanvas: ISkCanvas);
+    procedure DrawBalls(const ACanvas: ISkCanvas);
+    procedure DrawUI(const ACanvas: ISkCanvas);
+  protected
+    procedure Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single); override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+    procedure MouseMove(Shift: TShiftState; X, Y: Single); override;
+    procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single); override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+  end;
+
+implementation
+
+{ TSkiaBilliard }
+
+constructor TSkiaBilliard.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLock := TCriticalSection.Create;
+  Align := TAlignLayout.Client;
+  HitTest := True;
+  CanFocus := True;
+
+  FActive := True;
+  FBalls := TObjectList<TBall>.Create(True);
+  FPockets := TList<TPointF>.Create;
+  InitGame;
+  StartThread;
+end;
+
+destructor TSkiaBilliard.Destroy;
+begin
+  StopThread;
+  FreeAndNil(FBalls);
+  FreeAndNil(FPockets);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TSkiaBilliard.InitGame;
+var
+  B: TBall;
+  I: Integer;
+  TableW, TableH, OffsetX, OffsetY: Single;
+begin
+  FBalls.Clear;
+  FPockets.Clear;
+  
+  TableW := Width * 0.8;
+  TableH := Height * 0.6;
+  OffsetX := (Width - TableW) / 2;
+  OffsetY := (Height - TableH) / 2;
+  FTableRect := TRectF.Create(OffsetX, OffsetY, OffsetX + TableW, OffsetY + TableH);
+  
+  // Pockets (6 corners and middles)
+  FPockets.Add(PointF(FTableRect.Left, FTableRect.Top));
+  FPockets.Add(PointF(FTableRect.CenterPoint.X, FTableRect.Top));
+  FPockets.Add(PointF(FTableRect.Right, FTableRect.Top));
+  FPockets.Add(PointF(FTableRect.Left, FTableRect.Bottom));
+  FPockets.Add(PointF(FTableRect.CenterPoint.X, FTableRect.Bottom));
+  FPockets.Add(PointF(FTableRect.Right, FTableRect.Bottom));
+
+  // Cue Ball (White)
+  B := TBall.Create; B.Pos := PointF(FTableRect.CenterPoint.X - 150, FTableRect.CenterPoint.Y); B.Vel := TPointF.Zero; B.Radius := 12; B.Color := $FFFFFFFF; B.IsCue := True; FBalls.Add(B);
+  
+  // Colored Balls
+  for I := 0 to 2 do
+  begin
+    B := TBall.Create;
+    B.Pos := PointF(FTableRect.CenterPoint.X + 100, FTableRect.CenterPoint.Y + (I-1) * 25);
+    B.Vel := TPointF.Zero; B.Radius := 12;
+    case I of
+      0: B.Color := $FFFF0000; // Red
+      1: B.Color := $FFFFFF00; // Yellow
+      2: B.Color := $FF0000FF; // Blue
+    end;
+    B.IsCue := False;
+    FBalls.Add(B);
+  end;
+end;
+
+procedure TSkiaBilliard.ProcessCollisions;
+var
+  I, J: Integer;
+  B1, B2: TBall;
+  DX, DY, Dist, Overlap, NX, NY: Single;
+  V1N, V2N, V1T, V2T: Single;
+  P: TPointF;
+begin
+  // Ball to Ball Collisions
+  for I := 0 to FBalls.Count - 1 do
+  begin
+    B1 := FBalls[I];
+    if B1.Pocketed then Continue;
+    
+    for J := I + 1 to FBalls.Count - 1 do
+    begin
+      B2 := FBalls[J];
+      if B2.Pocketed then Continue;
+      
+      DX := B2.Pos.X - B1.Pos.X;
+      DY := B2.Pos.Y - B1.Pos.Y;
+      Dist := Hypot(DX, DY);
+      
+      if Dist < B1.Radius + B2.Radius then
+      begin
+        if Dist = 0 then Dist := 0.0001;
+        // Normal Vector
+        NX := DX / Dist;
+        NY := DY / Dist;
+        
+        // Separate balls (push apart)
+        Overlap := (B1.Radius + B2.Radius) - Dist;
+        B1.Pos.X := B1.Pos.X - NX * (Overlap / 2);
+        B1.Pos.Y := B1.Pos.Y - NY * (Overlap / 2);
+        B2.Pos.X := B2.Pos.X + NX * (Overlap / 2);
+        B2.Pos.Y := B2.Pos.Y + NY * (Overlap / 2);
+        
+        // Elastic Collision (Exchange velocities along normal)
+        // Dot products to find normal/tangential components
+        V1N := B1.Vel.X * NX + B1.Vel.Y * NY;
+        V2N := B2.Vel.X * NX + B2.Vel.Y * NY;
+        
+        V1T := B1.Vel.X * -NY + B1.Vel.Y * NX;
+        V2T := B2.Vel.X * -NY + B2.Vel.Y * NX;
+        
+        // Swap normal velocities (perfectly elastic, equal mass)
+        B1.Vel.X := V2N * NX + V1T * -NY;
+        B1.Vel.Y := V2N * NY + V1T * NX;
+        B2.Vel.X := V1N * NX + V2T * -NY;
+        B2.Vel.Y := V1N * NY + V2T * NX;
+      end;
+    end;
+    
+    // Wall Collisions (Cushions)
+    if B1.Pos.X - B1.Radius < FTableRect.Left then
+    begin
+      B1.Pos.X := FTableRect.Left + B1.Radius;
+      B1.Vel.X := -B1.Vel.X * 0.8; // Damping
+    end;
+    if B1.Pos.X + B1.Radius > FTableRect.Right then
+    begin
+      B1.Pos.X := FTableRect.Right - B1.Radius;
+      B1.Vel.X := -B1.Vel.X * 0.8;
+    end;
+    if B1.Pos.Y - B1.Radius < FTableRect.Top then
+    begin
+      B1.Pos.Y := FTableRect.Top + B1.Radius;
+      B1.Vel.Y := -B1.Vel.Y * 0.8;
+    end;
+    if B1.Pos.Y + B1.Radius > FTableRect.Bottom then
+    begin
+      B1.Pos.Y := FTableRect.Bottom - B1.Radius;
+      B1.Vel.Y := -B1.Vel.Y * 0.8;
+    end;
+    
+    // Pocket Collisions
+    for P in FPockets do
+    begin
+      if Hypot(B1.Pos.X - P.X, B1.Pos.Y - P.Y) < 20 then
+      begin
+        B1.Pocketed := True;
+        B1.Vel := TPointF.Zero;
+        // If cue ball is pocketed, reset it
+        if B1.IsCue then
+        begin
+          TThread.CreateAnonymousThread(
+            procedure
+            begin
+              Sleep(1000);
+              TThread.Queue(nil, procedure
+              begin
+                B1.Pocketed := False;
+                B1.Pos := PointF(FTableRect.CenterPoint.X - 150, FTableRect.CenterPoint.Y);
+                B1.Vel := TPointF.Zero;
+              end);
+            end).Start;
+        end;
+      end;
+    end;
+  end;
+end;
+
+procedure TSkiaBilliard.DoPhysicsUpdate(DeltaSec: Double);
+var
+  B: TBall;
+begin
+  if not FActive then Exit;
+
+  // Update Positions and apply friction
+  for B in FBalls do
+  begin
+    if B.Pocketed then Continue;
+    
+    B.Pos := B.Pos + TPointF.Create(B.Vel.X * DeltaSec, B.Vel.Y * DeltaSec);
+    
+    // Friction
+    B.Vel.X := B.Vel.X * 0.99;
+    B.Vel.Y := B.Vel.Y * 0.99;
+    if Abs(B.Vel.X) < 1 then B.Vel.X := 0;
+    if Abs(B.Vel.Y) < 1 then B.Vel.Y := 0;
+  end;
+  
+  ProcessCollisions;
+end;
+
+procedure TSkiaBilliard.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  B: TBall;
+begin
+  if Button = TMouseButton.mbLeft then
+  begin
+    // Find Cue Ball
+    for B in FBalls do
+    begin
+      if B.IsCue and not B.Pocketed then
+      begin
+        if Hypot(X - B.Pos.X, Y - B.Pos.Y) < 40 then
+        begin
+          FIsAiming := True;
+          FAimStart := B.Pos;
+          FAimCurrent := PointF(X, Y);
+          Break;
+        end;
+      end;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaBilliard.MouseMove(Shift: TShiftState; X, Y: Single);
+begin
+  if FIsAiming then
+    FAimCurrent := PointF(X, Y);
+  inherited;
+end;
+
+procedure TSkiaBilliard.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Single);
+var
+  B: TBall;
+  Drag: TPointF;
+begin
+  if FIsAiming then
+  begin
+    FIsAiming := False;
+    for B in FBalls do
+    begin
+      if B.IsCue and not B.Pocketed then
+      begin
+        Drag := FAimStart - FAimCurrent;
+        B.Vel := Drag * 5.0; // Power based on drag distance
+        Break;
+      end;
+    end;
+  end;
+  inherited;
+end;
+
+procedure TSkiaBilliard.Draw(const ACanvas: ISkCanvas; const ADest: TRectF; const AOpacity: Single);
+begin
+  ACanvas.Clear($FF2F2F2F);
+  DrawTable(ACanvas);
+  DrawBalls(ACanvas);
+  DrawAiming(ACanvas);
+  DrawUI(ACanvas);
+end;
+
+procedure TSkiaBilliard.DrawTable(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+  P: TPointF;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  // Table Border (Wood)
+  Paint.Color := $FF5A2D0C;
+  ACanvas.DrawRect(TRectF.Create(FTableRect.Left - 20, FTableRect.Top - 20, FTableRect.Right + 20, FTableRect.Bottom + 20), Paint);
+  
+  // Felt (Green)
+  Paint.Color := $FF0E6B0E;
+  ACanvas.DrawRect(FTableRect, Paint);
+  
+  // Pockets
+  Paint.Color := $FF000000;
+  for P in FPockets do
+    ACanvas.DrawCircle(P, 18, Paint);
+end;
+
+procedure TSkiaBilliard.DrawBalls(const ACanvas: ISkCanvas);
+var
+  B: TBall;
+  Paint: ISkPaint;
+begin
+  Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+  Paint.AntiAlias := True;
+  
+  for B in FBalls do
+  begin
+    if B.Pocketed then Continue;
+    
+    // Shadow
+    Paint.Color := $FF000000;
+    Paint.Alpha := 80;
+    ACanvas.DrawCircle(PointF(B.Pos.X + 2, B.Pos.Y + 2), B.Radius, Paint);
+    Paint.Alpha := 255;
+    
+    // Ball Body
+    Paint.Color := B.Color;
+    ACanvas.DrawCircle(B.Pos, B.Radius, Paint);
+    
+    // Highlight (3D effect)
+    Paint.Color := $FFFFFFFF;
+    Paint.Alpha := 150;
+    ACanvas.DrawCircle(PointF(B.Pos.X - 3, B.Pos.Y - 3), 3, Paint);
+    Paint.Alpha := 255;
+  end;
+end;
+
+procedure TSkiaBilliard.DrawAiming(const ACanvas: ISkCanvas);
+var
+  Paint: ISkPaint;
+begin
+  if not FIsAiming then Exit;
+  
+  Paint := TSkPaint.Create(TSkPaintStyle.Stroke);
+  Paint.StrokeWidth := 2;
+  Paint.Color := $FFFFFFFF;
+  
+  // Cue Stick
+  ACanvas.DrawLine(FAimCurrent, FAimStart, Paint);
+  
+  // Trajectory Dot
+  Paint.Style := TSkPaintStyle.Fill;
+  Paint.Alpha := 150;
+  var Drag := FAimStart - FAimCurrent;
+  ACanvas.DrawCircle(FAimStart + Drag, 3, Paint);
+end;
+
+procedure TSkiaBilliard.DrawUI(const ACanvas: ISkCanvas);
+var
+  Font: TSkFont;
+  Paint: ISkPaint;
+begin
+  Font := TSkFont.Create;
+  try
+    Paint := TSkPaint.Create(TSkPaintStyle.Fill);
+    Paint.AntiAlias := True;
+    Paint.Color := TAlphaColors.White;
+    ACanvas.DrawSimpleText('Drag from the White Ball to aim and shoot!', 10, 30, Font, Paint);
+  finally
+    Font.Free;
+  end;
+end;
+
+procedure TSkiaBilliard.SafeInvalidate;
+begin
+  if csDestroying in ComponentState then Exit;
+  TThread.Queue(nil,
+    procedure
+    begin
+      if not (csDestroying in ComponentState) and Assigned(Self) then
+      begin
+        Redraw;
+        Repaint;
+      end;
+    end});
+end;
+
+procedure TSkiaBilliard.StartThread;
+begin
+  if Assigned(FThread) then Exit;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    var
+      LastTime, NowTime, DeltaMS: Cardinal;
+    begin
+      LastTime := TThread.GetTickCount;
+      while not TThread.CheckTerminated do
+      begin
+        NowTime := TThread.GetTickCount;
+        DeltaMS := NowTime - LastTime;
+        if DeltaMS = 0 then DeltaMS := 1;
+        LastTime := NowTime;
+        if FActive then
+        begin
+          DoPhysicsUpdate(DeltaMS / 1000);
+          SafeInvalidate;
+        end;
+        Sleep(16);
+      end;
+    end);
+  FThread.FreeOnTerminate := True;
+  FThread.Start;
+end;
+
+procedure TSkiaBilliard.StopThread;
+begin
+  FActive := False;
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate;
+    Sleep(50);
+  end;
+end;
+
+end.
