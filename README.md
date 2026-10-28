@@ -11,4 +11,22 @@ Anyway, maybe someone out there can actually compile the DLL or find one somewhe
  **WebGPU4Delphi**          
       
 Is the start of a port of https://github.com/eliemichel/WebGPU-Cpp. The DLL loads, you get a surface, and yea... then loading something into it... BOOM! It explodes right into your face. Nah, seriously: It crashes constantly. I tried around a lot but couldn't get it running properly, so I let it be for now. But if someone wants to pick up the fight... this is a starting point. Got a color painted now yipeee but a cube crash at shader or pipeline...but anyway a bit more now...     
+                  
+ **SkiaAdventure Isometric**          
+-Working but only basics      
+<img  height="200" alt="adventure" src="https://github.com/user-attachments/assets/085b71d7-e185-4a94-ae84-26e70d3838c5" />      
       
+ **SkiaMadMarble**          
+-Working but not so good      
+<img height="200" alt="marble" src="https://github.com/user-attachments/assets/140a060e-9164-4a5c-91a3-83d914f8143d" />
+       
+ **SkiaQwirQ (kwirk)**          
+-Those damn rotating parts...partly it works but they are really evilish :P      
+<img height="200" alt="qwirq" src="https://github.com/user-attachments/assets/b22a9a40-79d7-4026-b514-74654898491c" />
+      
+ **SkiaVoxelCity**          
+-Working but not so good      
+<img height="200" alt="voxelcity" src="https://github.com/user-attachments/assets/0700cce3-f813-4669-bad2-5ed248027d31" />
+           
+ **Skia4Delphi Game Bones**           
+-not working but Basics written down of 26 Retro games to...make them working :D      
